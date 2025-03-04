@@ -56,18 +56,18 @@ const prediction = await predictionStore.createPrediction({
 
 The library is organized into independent modules that can be imported separately:
 
-- `@op-predict/lib/market-store` - Market creation and management
-- `@op-predict/lib/prediction-store` - Prediction operations and NFT receipts
-- `@op-predict/lib/user-balance-store` - User balance tracking
-- `@op-predict/lib/user-stats-store` - User statistics for leaderboards
-- `@op-predict/lib/bug-report-store` - Bug report management
-- `@op-predict/lib/kv-store` - Low-level KV store operations
-- `@op-predict/lib/logger` - Structured logging utilities
-- `@op-predict/lib/utils` - Shared utilities
+- `wisdom-sdk/market-store` - Market creation and management
+- `wisdom-sdk/prediction-store` - Prediction operations and NFT receipts
+- `wisdom-sdk/user-balance-store` - User balance tracking
+- `wisdom-sdk/user-stats-store` - User statistics for leaderboards
+- `wisdom-sdk/bug-report-store` - Bug report management
+- `wisdom-sdk/kv-store` - Low-level KV store operations
+- `wisdom-sdk/logger` - Structured logging utilities
+- `wisdom-sdk/utils` - Shared utilities
 
 ## Documentation
 
-For detailed API documentation, see the [API Reference](./docs/API.md).
+For detailed API documentation, see the GitHub repository at [github.com/r0zar/wisdom](https://github.com/r0zar/wisdom).
 
 ## Development
 
