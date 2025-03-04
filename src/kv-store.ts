@@ -305,14 +305,16 @@ export async function getDebugInfo(): Promise<Record<string, unknown>> {
 
     const result: Record<string, unknown> = {
       totalKeys: allKeys.length,
-      keysByPattern: {}
+      keysByPattern: {} as Record<string, { count: number; sample: string[] }>
     };
 
+    const keysByPattern = result.keysByPattern as Record<string, { count: number; sample: string[] }>;
+    
     for (const pattern of patterns) {
       const keys = await kv.keys(pattern);
-      result.keysByPattern[pattern] = {
+      keysByPattern[pattern] = {
         count: keys.length,
-        sample: keys.slice(0, 5)
+        sample: keys.slice(0, 5) as string[]
       };
     }
 
