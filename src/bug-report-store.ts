@@ -1,31 +1,26 @@
-import { z } from "zod";
-import * as kvStore from "./kv-store.js";
+import { z } from 'zod';
+import * as kvStore from './kv-store.js';
 import crypto from 'crypto';
-
-// Constants for KV store keys
-const BUG_REPORTS_KEY = 'bug_reports';
-const BUG_REPORT_IDS_KEY = 'bug_report_ids';
-const USER_BUG_REPORTS_KEY = (userId: string) => `user_bug_reports:${userId}`;
 
 // Define bug report types
 export const BugReportSchema = z.object({
-    id: z.string(),
-    title: z.string(),
-    description: z.string(),
-    severity: z.string(),
-    url: z.string().optional(),
-    createdBy: z.string(),
-    createdAt: z.string(),
-    status: z.enum(['open', 'in-progress', 'resolved', 'closed']).default('open'),
-    updatedAt: z.string().optional(),
-    updatedBy: z.string().optional(),
-    resolution: z.string().optional(),
-    // Reward-related fields
-    initialRewardPaid: z.boolean().optional(),
-    confirmationRewardPaid: z.boolean().optional(),
-    // Confirmation-related fields
-    confirmedBy: z.string().optional(),
-    confirmedAt: z.string().optional()
+  id: z.string(),
+  title: z.string(),
+  description: z.string(),
+  severity: z.string(),
+  url: z.string().optional(),
+  createdBy: z.string(),
+  createdAt: z.string(),
+  status: z.enum(['open', 'in-progress', 'resolved', 'closed']).default('open'),
+  updatedAt: z.string().optional(),
+  updatedBy: z.string().optional(),
+  resolution: z.string().optional(),
+  // Reward-related fields
+  initialRewardPaid: z.boolean().optional(),
+  confirmationRewardPaid: z.boolean().optional(),
+  // Confirmation-related fields
+  confirmedBy: z.string().optional(),
+  confirmedAt: z.string().optional()
 });
 
 export type BugReport = z.infer<typeof BugReportSchema>;
