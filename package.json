@@ -1,0 +1,109 @@
+{
+  "name": "wisdom-sdk",
+  "version": "2.0.0",
+  "description": "Core business logic and data access layer for prediction markets",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./market-store": {
+      "types": "./dist/market-store.d.ts",
+      "import": "./dist/market-store.js",
+      "require": "./dist/market-store.cjs"
+    },
+    "./prediction-store": {
+      "types": "./dist/prediction-store.d.ts",
+      "import": "./dist/prediction-store.js",
+      "require": "./dist/prediction-store.cjs"
+    },
+    "./user-balance-store": {
+      "types": "./dist/user-balance-store.d.ts",
+      "import": "./dist/user-balance-store.js",
+      "require": "./dist/user-balance-store.cjs"
+    },
+    "./user-stats-store": {
+      "types": "./dist/user-stats-store.d.ts",
+      "import": "./dist/user-stats-store.js",
+      "require": "./dist/user-stats-store.cjs"
+    },
+    "./bug-report-store": {
+      "types": "./dist/bug-report-store.d.ts",
+      "import": "./dist/bug-report-store.js",
+      "require": "./dist/bug-report-store.cjs"
+    },
+    "./kv-store": {
+      "types": "./dist/kv-store.d.ts",
+      "import": "./dist/kv-store.js",
+      "require": "./dist/kv-store.cjs"
+    },
+    "./utils": {
+      "types": "./dist/utils.d.ts",
+      "import": "./dist/utils.js",
+      "require": "./dist/utils.cjs"
+    },
+    "./logger": {
+      "types": "./dist/logger.d.ts",
+      "import": "./dist/logger.js",
+      "require": "./dist/logger.cjs"
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "build:tsc": "tsc",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src --ext .ts",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "pnpm clean && pnpm lint && pnpm test && pnpm build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vercel/kv": "^0.2.3",
+    "pino": "^9.6.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.8.7",
+    "@types/pino": "^7.0.5",
+    "@typescript-eslint/eslint-plugin": "^6.9.0",
+    "@typescript-eslint/parser": "^6.9.0",
+    "eslint": "^8.52.0",
+    "tsup": "^8.4.0",
+    "typescript": "^5.2.2",
+    "vitest": "^0.34.6"
+  },
+  "keywords": [
+    "prediction",
+    "market",
+    "op-predict",
+    "forecasting",
+    "prediction-markets",
+    "typescript"
+  ],
+  "author": "Charisma",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/r0zar/wisdom.git"
+  },
+  "homepage": "https://github.com/r0zar/wisdom#readme",
+  "bugs": {
+    "url": "https://github.com/r0zar/wisdom/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "packageManager": "pnpm@10.5.0"
+}

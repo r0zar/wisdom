@@ -1,0 +1,50 @@
+# Source files
+src/
+tests/
+tsconfig.json
+tsup.config.ts
+.eslintrc
+vitest.config.ts
+
+# GitHub files
+.github/
+.gitignore
+.git/
+
+# Build tools and configurations
+.prettierrc
+.nvmrc
+.editorconfig
+rollup.config.js
+webpack.config.js
+
+# Documentation not needed in the npm package
+docs/
+CONTRIBUTING.md
+MODERNIZATION.md
+*.md
+!README.md
+!LICENSE.md
+!CHANGELOG.md
+
+# Test files
+coverage/
+.nyc_output/
+*.spec.ts
+*.test.ts
+__tests__/
+__mocks__/
+
+# CI/CD
+.gitlab-ci.yml
+.travis.yml
+.circleci/
+.jenkins/
+
+# Misc
+.husky/
+.vscode/
+node_modules/
+logs/
+*.log
+.DS_Store
