@@ -18,7 +18,7 @@ export function isAdmin(userId: string): boolean {
  * @param outcomes Market outcomes
  * @returns Outcomes with percentages and a flag indicating if vote-based fallback was used
  */
-export function calculateOutcomePercentages(outcomes: any[]) {
+export function calculateOutcomePercentages(outcomes: { id: number; name: string; amount?: number; votes?: number }[]) {
   // Calculate total amount staked for percentage
   const totalAmount = outcomes.reduce((sum, outcome) => sum + (outcome.amount || 0), 0);
   const useFallbackVotes = totalAmount === 0;

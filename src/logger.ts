@@ -1,9 +1,9 @@
 // Simple logger interface
 export interface Logger {
-  info: (obj: any, msg?: string) => void;
-  error: (obj: any, msg?: string) => void;
-  warn: (obj: any, msg?: string) => void;
-  debug: (obj: any, msg?: string) => void;
+  info: (obj: Record<string, unknown>, msg?: string) => void;
+  error: (obj: Record<string, unknown>, msg?: string) => void;
+  warn: (obj: Record<string, unknown>, msg?: string) => void;
+  debug: (obj: Record<string, unknown>, msg?: string) => void;
   child: (bindings: object) => Logger;
 }
 
@@ -14,11 +14,14 @@ export interface Logger {
  * context and standardized error handling.
  */
 
+// Import type dynamically to avoid direct require
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const pino = require('pino');
+
 // Create a logger factory
 const createLogger = (): Logger => {
   try {
-    // Try to import pino dynamically at runtime
-    const { pino } = require('pino');
+    // Use imported pino module
     return pino({
       level: process.env.LOG_LEVEL || 'info',
       base: { service: 'wisdom-sdk' },
@@ -26,10 +29,10 @@ const createLogger = (): Logger => {
   } catch (e) {
     // Fallback logger implementation
     return {
-      info: (obj: any, msg?: string) => console.info(msg || '', obj),
-      error: (obj: any, msg?: string) => console.error(msg || '', obj),
-      warn: (obj: any, msg?: string) => console.warn(msg || '', obj),
-      debug: (obj: any, msg?: string) => console.debug(msg || '', obj),
+      info: (obj: Record<string, unknown>, msg?: string) => console.info(msg || '', obj),
+      error: (obj: Record<string, unknown>, msg?: string) => console.error(msg || '', obj),
+      warn: (obj: Record<string, unknown>, msg?: string) => console.warn(msg || '', obj),
+      debug: (obj: Record<string, unknown>, msg?: string) => console.debug(msg || '', obj),
       child: (bindings: object) => {
         console.info('Creating child logger with bindings:', bindings);
         return createLogger();
