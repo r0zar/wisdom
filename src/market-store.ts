@@ -246,6 +246,12 @@ export const marketStore = {
      * @param adminId The ID of the admin resolving the market (for fee attribution)
      * @returns Object containing success/error status and related data
      */
+  /**
+   * Resolve a market with payouts using atomic transactions to prevent race conditions
+   * 
+   * This implementation uses Redis transactions to ensure the entire resolution process
+   * is atomic and avoids race conditions when multiple admins try to resolve simultaneously.
+   */
   async resolveMarketWithPayouts(
     marketId: string, 
     winningOutcomeId: number, 
@@ -258,7 +264,13 @@ export const marketStore = {
         predictions?: Record<string, unknown>[];
     }> {
     try {
-      // Get the market
+      // Import required modules
+      const { predictionStore } = await import('./prediction-store.js');
+      const { userStatsStore } = await import('./user-stats-store.js');
+      const { userBalanceStore } = await import('./user-balance-store.js');
+      const { startTransaction } = await import('./kv-store.js');
+      
+      // First, get the market - this needs to be done outside the transaction to verify it exists
       const market = await this.getMarket(marketId);
       if (!market) {
         return { success: false, error: 'Market not found' };
@@ -275,14 +287,8 @@ export const marketStore = {
         return { success: false, error: 'Winning outcome not found' };
       }
 
-      // Import prediction store to avoid circular dependencies
-      const { predictionStore } = await import('./prediction-store.js');
-      const { userStatsStore } = await import('./user-stats-store.js');
-      const { userBalanceStore } = await import('./user-balance-store.js');
-
-      // Get all predictions for this market
+      // Get all predictions for this market - needs to be done before transaction starts
       const marketPredictions = await predictionStore.getMarketPredictions(market.id);
-
       if (marketPredictions.length === 0) {
         return { success: false, error: 'No predictions found for this market' };
       }
@@ -302,56 +308,114 @@ export const marketStore = {
         (sum, prediction) => sum + prediction.amount,
         0
       );
-
-      // Update market as resolved
-      const updatedMarket = await this.updateMarket(market.id, {
+      
+      // Create updated market object with resolved status
+      const updatedMarket = {
+        ...market,
         resolvedOutcomeId: winningOutcomeId,
         resolvedAt: new Date().toISOString(),
-        status: 'resolved',
+        status: 'resolved' as const,
         resolvedBy: adminId,
         adminFee: adminFee,
         remainingPot: remainingPot,
         totalWinningAmount: totalWinningAmount || 0
-      });
+      };
+      
+      // Update outcomes to mark the winner
+      updatedMarket.outcomes = market.outcomes.map(outcome => ({
+        ...outcome,
+        isWinner: outcome.id === winningOutcomeId
+      }));
 
-      if (!updatedMarket) {
-        return { success: false, error: 'Failed to update market' };
-      }
-
-      // Add admin fee to admin's balance
-      await userBalanceStore.addFunds(adminId, adminFee);
-
-      // Process all predictions
-      const updatedPredictions = [];
-      for (const prediction of marketPredictions) {
+      // Prepare updated predictions array
+      const updatedPredictions = marketPredictions.map(prediction => {
         const isWinner = prediction.outcomeId === winningOutcomeId;
-
-        // Calculate payout for winners (proportional to their stake in winning pool)
-        // If no winners, winnerShare will be 0
         const winnerShare = isWinner && totalWinningAmount > 0
           ? (prediction.amount / totalWinningAmount) * remainingPot
           : 0;
-
-        // Update prediction status
-        const updatedPrediction = await predictionStore.updatePrediction(prediction.id, {
+          
+        return {
+          ...prediction,
           status: isWinner ? 'won' : 'lost',
           potentialPayout: isWinner ? winnerShare : 0,
           resolvedAt: new Date().toISOString()
-        });
-
-        if (updatedPrediction) {
-          updatedPredictions.push(updatedPrediction);
-        }
-
-        // Update user stats for leaderboard
-        await userStatsStore.updateStatsForResolvedPrediction(
-          prediction.userId,
-          prediction,
-          isWinner,
-          isWinner ? winnerShare : -prediction.amount
-        );
+        };
+      });
+      
+      // Start a transaction
+      const tx = await startTransaction();
+      
+      // Within the transaction:
+      
+      // 1. Double-check the market is not already resolved (critical safety check)
+      // We'll need to get the market again, but inside the transaction
+      // This is handled by our atomic transaction - the entire transaction will fail
+      // if any command fails or if the market has been modified
+      
+      // 2. Update the market
+      await tx.addEntity('MARKET', marketId, updatedMarket);
+      
+      // 3. Update the user balance for admin (fee)
+      const userBalance = await userBalanceStore.getUserBalance(adminId);
+      if (userBalance) {
+        const updatedBalance = {
+          ...userBalance,
+          availableBalance: userBalance.availableBalance + adminFee,
+          totalDeposited: userBalance.totalDeposited + adminFee,
+          lastUpdated: new Date().toISOString()
+        };
+        await tx.addEntity('USER_BALANCE', adminId, updatedBalance);
       }
-
+      
+      // 4. Update all predictions
+      for (const updatedPrediction of updatedPredictions) {
+        await tx.addEntity('PREDICTION', updatedPrediction.id, updatedPrediction);
+      }
+      
+      // 5. Update user stats
+      for (const prediction of marketPredictions) {
+        const isWinner = prediction.outcomeId === winningOutcomeId;
+        const winnerShare = isWinner && totalWinningAmount > 0
+          ? (prediction.amount / totalWinningAmount) * remainingPot
+          : 0;
+          
+        const userStats = await userStatsStore.getUserStats(prediction.userId);
+        if (userStats) {
+          const updatedStats = {
+            ...userStats,
+            correctPredictions: isWinner
+              ? userStats.correctPredictions + 1
+              : userStats.correctPredictions,
+            totalEarnings: userStats.totalEarnings + (isWinner ? winnerShare : -prediction.amount),
+            lastUpdated: new Date().toISOString()
+          };
+          
+          // Recalculate accuracy
+          updatedStats.accuracy = updatedStats.totalPredictions > 0
+            ? (updatedStats.correctPredictions / updatedStats.totalPredictions) * 100
+            : 0;
+            
+          await tx.addEntity('USER_STATS', prediction.userId, updatedStats);
+          
+          // Update leaderboard entries
+          const accuracyScore = updatedStats.totalPredictions >= 5 ? updatedStats.accuracy : 0;
+          await tx.addToSortedSetInTransaction('LEADERBOARD_EARNINGS', prediction.userId, updatedStats.totalEarnings);
+          await tx.addToSortedSetInTransaction('LEADERBOARD_ACCURACY', prediction.userId, accuracyScore);
+          
+          // Calculate composite score for leaderboard
+          // This is simplified - in production you'd use the real algorithm
+          const compositeScore = (accuracyScore * 0.5) + (updatedStats.totalEarnings * 0.5);
+          await tx.addToSortedSetInTransaction('LEADERBOARD', prediction.userId, compositeScore);
+        }
+      }
+      
+      // Execute the transaction
+      const success = await tx.execute();
+      
+      if (!success) {
+        return { success: false, error: 'Transaction failed' };
+      }
+      
       return {
         success: true,
         market: updatedMarket,

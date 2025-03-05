@@ -5,6 +5,8 @@ import { kv } from '@vercel/kv';
  * 
  * This provides standardized methods for interacting with Vercel KV storage,
  * ensuring consistent key formats, serialization/deserialization, and error handling.
+ * 
+ * Also provides transaction support to ensure data consistency for complex operations.
  */
 
 // Define constant prefixes for all entity types
@@ -322,5 +324,57 @@ export async function getDebugInfo(): Promise<Record<string, unknown>> {
   } catch (error) {
     console.error('Error getting debug info:', error);
     return { error: String(error) };
+  }
+}
+
+/**
+ * Start a Redis transaction for atomic operations
+ * @returns A transaction object with methods that queue commands to be executed atomically
+ */
+export async function startTransaction() {
+  try {
+    // @vercel/kv supports Redis transactions via the multi() method
+    const transaction = kv.multi();
+    
+    return {
+      transaction,
+      
+      // Add entity to transaction
+      async addEntity<T>(entityType: EntityType, id: string, data: T): Promise<void> {
+        const key = getKey(entityType, id);
+        transaction.set(key, JSON.stringify(data));
+      },
+      
+      // Add to set in transaction
+      async addToSetInTransaction(setType: EntityType, id: string, memberId: string): Promise<void> {
+        const key = getKey(setType, id);
+        transaction.sadd(key, memberId);
+        
+        // Handle backward compatibility if needed
+        if (setType === 'MARKET_IDS') {
+          transaction.sadd('market_ids', memberId);
+        }
+      },
+      
+      // Add to sorted set in transaction
+      async addToSortedSetInTransaction(setType: EntityType, memberId: string, score: number): Promise<void> {
+        const key = getKey(setType);
+        transaction.zadd(key, { score, member: memberId });
+      },
+      
+      // Execute all queued commands atomically
+      async execute(): Promise<boolean> {
+        try {
+          await transaction.exec();
+          return true;
+        } catch (error) {
+          console.error('Error executing transaction:', error);
+          return false;
+        }
+      }
+    };
+  } catch (error) {
+    console.error('Error starting transaction:', error);
+    throw error;
   }
 }
