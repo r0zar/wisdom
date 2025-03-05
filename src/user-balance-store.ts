@@ -1,20 +1,11 @@
 import * as kvStore from './kv-store.js';
-
-// Define user balance types
-export type UserBalance = {
-    userId: string;
-    availableBalance: number;
-    totalDeposited: number;
-    totalWithdrawn: number;
-    inPredictions: number;
-    lastUpdated: string;
-};
+import { UserBalance, IUserBalanceStore } from './types.js';
 
 // Default starting balance for new users
 const DEFAULT_STARTING_BALANCE = 1000;
 
 // User balance store with Vercel KV
-export const userBalanceStore = {
+export const userBalanceStore: IUserBalanceStore = {
   // Get user balance for a specific user
   async getUserBalance(userId: string): Promise<UserBalance | null> {
     try {

@@ -1,43 +1,22 @@
 import * as kvStore from './kv-store.js';
 import crypto from 'crypto';
-
-// Define market types
-export type MarketOutcome = {
-    id: number;
-    name: string;
-    votes?: number;
-    amount?: number; // Total amount staked on this outcome
-    isWinner?: boolean;
-};
-
-export type Market = {
-    id: string;
-    type: 'binary' | 'multiple';
-    name: string;
-    description: string;
-    createdBy: string;
-    outcomes: MarketOutcome[];
-    category: string;
-    endDate: string;
-    createdAt: string;
-    updatedAt?: string;
-    imageUrl?: string;
-    participants?: number;
-    poolAmount?: number;
-    status: 'draft' | 'active' | 'resolved' | 'cancelled';
-    resolvedOutcomeId?: number; // The ID of the winning outcome
-    resolvedAt?: string; // When the market was resolved
-    resolvedBy?: string; // Admin who resolved the market
-    adminFee?: number; // 5% fee taken by admin on resolution
-    remainingPot?: number; // Pot after admin fee
-    totalWinningAmount?: number; // Total amount staked on winning outcome
-};
+import { 
+  Market, 
+  MarketOutcome, 
+  IMarketStore, 
+  Prediction
+} from './types.js';
+import { 
+  getPredictionStore, 
+  getUserBalanceStore, 
+  getUserStatsStore 
+} from './services.js';
 
 // Define admin fee percentage
 const ADMIN_FEE_PERCENTAGE = 0.05; // 5%
 
 // Market store with Vercel KV
-export const marketStore = {
+export const marketStore: IMarketStore = {
   // Get all markets
   async getMarkets(): Promise<Market[]> {
     try {
@@ -264,11 +243,11 @@ export const marketStore = {
         predictions?: Record<string, unknown>[];
     }> {
     try {
-      // Import required modules
-      const { predictionStore } = await import('./prediction-store.js');
-      const { userStatsStore } = await import('./user-stats-store.js');
-      const { userBalanceStore } = await import('./user-balance-store.js');
-      const { startTransaction } = await import('./kv-store.js');
+      // Get services from registry
+      const predictionStore = getPredictionStore();
+      const userStatsStore = getUserStatsStore();
+      const userBalanceStore = getUserBalanceStore();
+      const { startTransaction } = kvStore;
       
       // First, get the market - this needs to be done outside the transaction to verify it exists
       const market = await this.getMarket(marketId);

@@ -1,36 +1,19 @@
 import * as kvStore from './kv-store.js';
 import crypto from 'crypto';
-// Type imports are performed when needed via dynamic imports to avoid circular dependencies
-
-// Define the prediction data types
-export type Prediction = {
-    id: string;
-    marketId: string;
-    outcomeId: number;
-    outcomeName: string;
-    userId: string;
-    amount: number;
-    createdAt: string;
-    nftReceipt: PredictionNFTReceipt;
-    status: 'active' | 'won' | 'lost' | 'redeemed' | 'cancelled';
-    potentialPayout?: number;
-    resolvedAt?: string;
-    redeemedAt?: string;
-};
-
-export type PredictionNFTReceipt = {
-    id: string;
-    tokenId: string;
-    image: string;
-    predictionId: string;
-    marketName: string;
-    outcomeName: string;
-    amount: number;
-    createdAt: string;
-};
+import { 
+  Prediction, 
+  PredictionNFTReceipt,
+  IPredictionStore
+} from './types.js';
+import {
+  getMarketStore,
+  getUserBalanceStore,
+  getUserStatsStore
+} from './services.js';
+import { isAdmin } from './utils.js';
 
 // Prediction store with Vercel KV
-export const predictionStore = {
+export const predictionStore: IPredictionStore = {
   // Create a new prediction
   async createPrediction(data: {
         marketId: string;
@@ -70,7 +53,7 @@ export const predictionStore = {
       };
 
       // Store the prediction and NFT receipt
-      const { marketStore } = await import('./market-store.js');
+      const marketStore = getMarketStore();
             
       await Promise.all([
         kvStore.storeEntity('PREDICTION', id, prediction),
@@ -234,10 +217,10 @@ export const predictionStore = {
         outcomeName?: string;
     }> {
     try {
-      // Import stores (to avoid circular dependencies)
-      const { marketStore } = await import('./market-store.js');
-      const { userBalanceStore } = await import('./user-balance-store.js');
-      const { userStatsStore } = await import('./user-stats-store.js');
+      // Get services from registry
+      const marketStore = getMarketStore();
+      const userBalanceStore = getUserBalanceStore();
+      const userStatsStore = getUserStatsStore();
             
       // Get the market to verify it exists and get outcome name
       const market = await marketStore.getMarket(data.marketId);
@@ -386,8 +369,7 @@ export const predictionStore = {
         return { success: false, error: 'Prediction not found' };
       }
 
-      // Import utils to check admin status
-      const { isAdmin } = await import('./utils.js');
+      // Use isAdmin function directly (already imported at the top)
       const userIsAdmin = isAdmin(userId);
 
       // Verify the prediction belongs to the user or user is admin
@@ -458,8 +440,8 @@ export const predictionStore = {
         return { success: false, error: 'Failed to update prediction' };
       }
 
-      // Import balance store to update user balance
-      const { userBalanceStore } = await import('./user-balance-store.js');
+      // Get userBalanceStore from registry
+      const userBalanceStore = getUserBalanceStore();
 
       // Update user's balance
       if (payout > 0) {

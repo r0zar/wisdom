@@ -1,25 +1,13 @@
 import * as kvStore from './kv-store.js';
-import { Prediction } from './prediction-store.js';
-
-// Define user stats types
-export type UserStats = {
-    userId: string;
-    username?: string;
-    totalPredictions: number;
-    correctPredictions: number;
-    accuracy: number;
-    totalAmount: number;
-    totalEarnings: number;
-    lastUpdated: string;
-};
-
-export type LeaderboardEntry = UserStats & {
-    rank?: number;
-    score?: number;
-};
+import { 
+  UserStats, 
+  LeaderboardEntry, 
+  Prediction, 
+  IUserStatsStore 
+} from './types.js';
 
 // User stats store with Vercel KV
-export const userStatsStore = {
+export const userStatsStore: IUserStatsStore = {
   // Helper to calculate user score consistently across the app
   calculateUserScore(stats: UserStats): number {
     // Only count users with at least 5 predictions for the accuracy component

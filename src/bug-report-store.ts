@@ -1,35 +1,13 @@
-import { z } from 'zod';
 import * as kvStore from './kv-store.js';
 import crypto from 'crypto';
-
-// Define bug report types
-export const BugReportSchema = z.object({
-  id: z.string(),
-  title: z.string(),
-  description: z.string(),
-  severity: z.string(),
-  url: z.string().optional(),
-  createdBy: z.string(),
-  createdAt: z.string(),
-  status: z.enum(['open', 'in-progress', 'resolved', 'closed']).default('open'),
-  updatedAt: z.string().optional(),
-  updatedBy: z.string().optional(),
-  resolution: z.string().optional(),
-  // Reward-related fields
-  initialRewardPaid: z.boolean().optional(),
-  confirmationRewardPaid: z.boolean().optional(),
-  // Confirmation-related fields
-  confirmedBy: z.string().optional(),
-  confirmedAt: z.string().optional()
-});
-
-export type BugReport = z.infer<typeof BugReportSchema>;
+import { BugReport, IBugReportStore } from './types.js';
+import { getUserBalanceStore } from './services.js';
 
 // Default reward amounts
 const DEFAULT_INITIAL_REWARD = 10;
 const DEFAULT_CONFIRMATION_REWARD = 90;
 
-export class BugReportStore {
+export class BugReportStore implements IBugReportStore {
   async getBugReports(): Promise<BugReport[]> {
     try {
       // Get all bug report IDs
@@ -157,8 +135,8 @@ export class BugReportStore {
         report?: BugReport;
     }> {
     try {
-      // Import balance store to avoid circular dependencies
-      const { userBalanceStore } = await import('./user-balance-store.js');
+      // Get userBalanceStore from registry
+      const userBalanceStore = getUserBalanceStore();
 
       // Get the bug report
       const report = await this.getBugReport(reportId);
