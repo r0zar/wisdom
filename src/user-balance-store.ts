@@ -15,7 +15,7 @@ export const userBalanceStore: IUserBalanceStore = {
 
       // If no balance exists, initialize with default balance
       if (!balance) {
-        balance = await this.initializeUserBalance(userId);
+        balance = await this.createUserBalance(userId);
       }
 
       return balance;
@@ -26,7 +26,7 @@ export const userBalanceStore: IUserBalanceStore = {
   },
 
   // Initialize a new user with default balance
-  async initializeUserBalance(userId: string): Promise<UserBalance> {
+  async createUserBalance(userId: string): Promise<UserBalance> {
     try {
       const newBalance: UserBalance = {
         userId,

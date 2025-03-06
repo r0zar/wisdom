@@ -32,18 +32,19 @@ describe('Bug Report Store', () => {
   });
 
   it('should have required methods', () => {
-    expect(typeof bugReportStore.getBugReports).toBe('function');
+    expect(typeof bugReportStore.getAllBugReports).toBe('function');
     expect(typeof bugReportStore.getBugReport).toBe('function');
     expect(typeof bugReportStore.createBugReport).toBe('function');
     expect(typeof bugReportStore.updateBugReport).toBe('function');
     expect(typeof bugReportStore.deleteBugReport).toBe('function');
-    expect(typeof bugReportStore.processRewardPayment).toBe('function');
+    expect(typeof bugReportStore.confirmBugReport).toBe('function');
+    expect(typeof bugReportStore.payReward).toBe('function');
   });
 
   it('should return an empty array when no bug reports exist', async () => {
     vi.mocked(kvStore.getSetMembers).mockResolvedValue([]);
     
-    const reports = await bugReportStore.getBugReports();
+    const reports = await bugReportStore.getAllBugReports();
     
     expect(reports).toEqual([]);
     expect(kvStore.getSetMembers).toHaveBeenCalledWith('BUG_REPORT_IDS', '');

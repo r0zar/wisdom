@@ -3,7 +3,8 @@ import crypto from 'crypto';
 import { 
   Prediction, 
   PredictionNFTReceipt,
-  IPredictionStore
+  IPredictionStore,
+  Market
 } from './types.js';
 import {
   getMarketStore,
@@ -11,6 +12,10 @@ import {
   getUserStatsStore
 } from './services.js';
 import { isAdmin } from './utils.js';
+import { AppError, logger } from './logger.js';
+
+// Create a logger instance for this module
+const predictionLogger = logger.child({ context: 'prediction-store' });
 
 // Prediction store with Vercel KV
 export const predictionStore: IPredictionStore = {
@@ -24,8 +29,27 @@ export const predictionStore: IPredictionStore = {
         amount: number;
     }): Promise<Prediction> {
     try {
+      // Validate input
+      if (!data.marketId || !data.userId || data.amount <= 0) {
+        throw new AppError({
+          message: 'Invalid prediction data',
+          context: 'prediction-store',
+          code: 'PREDICTION_VALIDATION_ERROR',
+          data: { 
+            hasMarketId: !!data.marketId, 
+            hasUserId: !!data.userId,
+            amount: data.amount
+          }
+        }).log();
+      }
+      
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
+
+      predictionLogger.debug(
+        { marketId: data.marketId, userId: data.userId, amount: data.amount },
+        'Creating new prediction'
+      );
 
       // Generate NFT receipt
       const nftReceipt: PredictionNFTReceipt = {
@@ -52,22 +76,74 @@ export const predictionStore: IPredictionStore = {
         status: 'active'
       };
 
-      // Store the prediction and NFT receipt
-      const marketStore = getMarketStore();
-            
-      await Promise.all([
-        kvStore.storeEntity('PREDICTION', id, prediction),
-        kvStore.storeEntity('PREDICTION_NFT', nftReceipt.id, nftReceipt),
-        kvStore.addToSet('USER_PREDICTIONS', data.userId, id),
-        kvStore.addToSet('MARKET_PREDICTIONS', data.marketId, id),
-        // Update market stats - passing userId to track unique participants
-        marketStore.updateMarketStats(data.marketId, data.outcomeId, data.amount, data.userId)
-      ]);
-
-      return prediction;
+      // Start a transaction for atomic operation
+      const tx = await kvStore.startTransaction();
+      
+      try {
+        // Add all operations to the transaction
+        await tx.addEntity('PREDICTION', id, prediction);
+        await tx.addEntity('PREDICTION_NFT', nftReceipt.id, nftReceipt);
+        await tx.addToSetInTransaction('USER_PREDICTIONS', data.userId, id);
+        await tx.addToSetInTransaction('MARKET_PREDICTIONS', data.marketId, id);
+        
+        // Execute the transaction
+        const success = await tx.execute();
+        
+        if (!success) {
+          throw new AppError({
+            message: 'Failed to create prediction - transaction failed',
+            context: 'prediction-store',
+            code: 'PREDICTION_TRANSACTION_ERROR',
+            data: { predictionId: id }
+          }).log();
+        }
+        
+        // Update market stats separately since it requires accessing the market store
+        // This is not included in the transaction since it involves another store
+        const marketStore = getMarketStore();
+        await marketStore.updateMarketStats(
+          data.marketId, 
+          data.outcomeId, 
+          data.amount, 
+          data.userId
+        );
+        
+        predictionLogger.info(
+          { predictionId: id, userId: data.userId }, 
+          'Prediction created successfully'
+        );
+        
+        return prediction;
+      } catch (error) {
+        // Rethrow AppErrors, wrap others
+        if (error instanceof AppError) {
+          throw error;
+        } else {
+          throw new AppError({
+            message: 'Error during prediction creation transaction',
+            context: 'prediction-store',
+            code: 'PREDICTION_CREATE_ERROR',
+            originalError: error instanceof Error ? error : new Error(String(error)),
+            data: { marketId: data.marketId, userId: data.userId }
+          }).log();
+        }
+      }
     } catch (error) {
-      console.error('Error creating prediction:', error);
-      throw error;
+      if (error instanceof AppError) {
+        throw error;
+      } else {
+        throw new AppError({
+          message: 'Failed to create prediction',
+          context: 'prediction-store',
+          code: 'PREDICTION_CREATE_ERROR',
+          originalError: error instanceof Error ? error : new Error(String(error)),
+          data: { 
+            marketId: data.marketId, 
+            userId: data.userId,
+            amount: data.amount
+          }
+        }).log();
+      }
     }
   },
 
@@ -217,6 +293,32 @@ export const predictionStore: IPredictionStore = {
         outcomeName?: string;
     }> {
     try {
+      // Set up structured logging for this operation
+      const opLogger = predictionLogger.child({
+        operation: 'createPredictionWithBalance',
+        marketId: data.marketId,
+        userId: data.userId,
+        amount: data.amount
+      });
+      
+      opLogger.info({}, 'Starting prediction creation with balance update');
+      
+      // Input validation
+      if (!data.marketId || !data.userId || data.amount <= 0) {
+        const error = new AppError({
+          message: 'Invalid prediction data',
+          context: 'prediction-store',
+          code: 'PREDICTION_VALIDATION_ERROR',
+          data: {
+            hasMarketId: !!data.marketId,
+            hasUserId: !!data.userId,
+            amount: data.amount
+          }
+        }).log();
+        
+        return { success: false, error: error.message };
+      }
+      
       // Get services from registry
       const marketStore = getMarketStore();
       const userBalanceStore = getUserBalanceStore();
@@ -225,33 +327,100 @@ export const predictionStore: IPredictionStore = {
       // Get the market to verify it exists and get outcome name
       const market = await marketStore.getMarket(data.marketId);
       if (!market) {
-        return { success: false, error: 'Market not found' };
+        const error = new AppError({
+          message: `Market not found: ${data.marketId}`,
+          context: 'prediction-store',
+          code: 'MARKET_NOT_FOUND',
+          data: { marketId: data.marketId }
+        }).log();
+        
+        return { success: false, error: error.message };
       }
 
       // Find the outcome
       const outcome = market.outcomes.find(o => o.id === data.outcomeId);
       if (!outcome) {
-        return { success: false, error: 'Outcome not found' };
+        const error = new AppError({
+          message: `Outcome ${data.outcomeId} not found in market ${data.marketId}`,
+          context: 'prediction-store',
+          code: 'OUTCOME_NOT_FOUND',
+          data: { 
+            marketId: data.marketId, 
+            outcomeId: data.outcomeId,
+            availableOutcomes: market.outcomes.map(o => o.id) 
+          }
+        }).log();
+        
+        return { success: false, error: error.message };
       }
 
       // Check if market is already resolved
       if (market.resolvedOutcomeId !== undefined) {
-        return { success: false, error: 'Market is already resolved' };
+        const error = new AppError({
+          message: `Market ${data.marketId} is already resolved`,
+          context: 'prediction-store',
+          code: 'MARKET_ALREADY_RESOLVED',
+          data: { 
+            marketId: data.marketId,
+            resolvedOutcomeId: market.resolvedOutcomeId
+          }
+        }).log();
+        
+        return { success: false, error: error.message };
       }
 
       // Check if market end date has passed
       if (new Date(market.endDate) < new Date()) {
-        return { success: false, error: 'Market has ended' };
+        const error = new AppError({
+          message: `Market ${data.marketId} has ended`,
+          context: 'prediction-store',
+          code: 'MARKET_ENDED',
+          data: { 
+            marketId: data.marketId, 
+            endDate: market.endDate,
+            currentDate: new Date().toISOString()
+          }
+        }).log();
+        
+        return { success: false, error: error.message };
       }
 
+      opLogger.debug({}, 'Market validation completed, processing balance update');
+      
       // Deduct the amount from user's balance
-      const balanceResult = await userBalanceStore.updateBalanceForPrediction(
-        data.userId,
-        data.amount
-      );
-
-      if (!balanceResult) {
-        return { success: false, error: 'Failed to update user balance' };
+      try {
+        const balanceResult = await userBalanceStore.updateBalanceForPrediction(
+          data.userId,
+          data.amount
+        );
+  
+        if (!balanceResult) {
+          throw new AppError({
+            message: 'Failed to update user balance',
+            context: 'prediction-store',
+            code: 'BALANCE_UPDATE_FAILED',
+            data: { userId: data.userId, amount: data.amount }
+          });
+        }
+        
+        opLogger.debug({}, 'Balance updated successfully, creating prediction');
+      } catch (balanceError) {
+        // Handle insufficient balance case specifically
+        if (balanceError instanceof Error && 
+            balanceError.message.includes('Insufficient balance')) {
+          const error = new AppError({
+            message: 'Insufficient balance. Please add more funds to your account.',
+            context: 'prediction-store',
+            code: 'INSUFFICIENT_BALANCE',
+            originalError: balanceError,
+            data: { userId: data.userId, amount: data.amount }
+          }).log();
+          
+          return { success: false, error: error.message };
+        }
+        
+        // Rethrow other errors
+        throw balanceError;
       }
 
       // Create the prediction with NFT receipt
@@ -264,28 +433,49 @@ export const predictionStore: IPredictionStore = {
         amount: data.amount
       });
 
+      opLogger.debug(
+        { predictionId: prediction.id }, 
+        'Prediction created, updating user stats'
+      );
+      
       // Update user stats for leaderboard tracking
       await userStatsStore.updateStatsForNewPrediction(data.userId, prediction);
 
+      opLogger.info(
+        { predictionId: prediction.id }, 
+        'Prediction with balance update completed successfully'
+      );
+      
+      // Convert market to Record<string, unknown> to comply with return type
+      const marketData: Record<string, unknown> = { ...market };
+      
       return {
         success: true,
         prediction,
-        market,
+        market: marketData,
         outcomeName: outcome.name
       };
     } catch (error) {
-      // Handle specific errors
-      if (error instanceof Error) {
-        if (error.message === 'Insufficient balance') {
-          return {
-            success: false,
-            error: 'Insufficient balance. Please add more funds to your account.'
-          };
-        }
+      // If it's already an AppError, just log and return it
+      if (error instanceof AppError) {
+        error.log();
+        return { success: false, error: error.message };
       }
-            
-      console.error('Error creating prediction with balance update:', error);
-      return { success: false, error: 'Failed to create prediction' };
+      
+      // Handle other errors
+      const appError = new AppError({
+        message: 'Failed to create prediction',
+        context: 'prediction-store',
+        code: 'PREDICTION_CREATE_ERROR',
+        originalError: error instanceof Error ? error : new Error(String(error)),
+        data: { 
+          marketId: data.marketId, 
+          userId: data.userId, 
+          amount: data.amount 
+        }
+      }).log();
+      
+      return { success: false, error: appError.message };
     }
   },
 

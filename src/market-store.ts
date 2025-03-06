@@ -11,6 +11,10 @@ import {
   getUserBalanceStore, 
   getUserStatsStore 
 } from './services.js';
+import { AppError, logger } from './logger.js';
+
+// Create a logger instance for this module
+const marketLogger = logger.child({ context: 'market-store' });
 
 // Define admin fee percentage
 const ADMIN_FEE_PERCENTAGE = 0.05; // 5%
@@ -24,6 +28,7 @@ export const marketStore: IMarketStore = {
       const marketIds = await kvStore.getSetMembers('MARKET_IDS', '');
 
       if (marketIds.length === 0) {
+        marketLogger.info({}, 'No markets found, creating sample markets');
         // If no markets exist, create sample markets
         await this.createSampleMarkets();
         return this.getMarkets();
@@ -35,10 +40,23 @@ export const marketStore: IMarketStore = {
       );
 
       // Filter out any undefined markets (in case of data inconsistency)
-      return markets.filter(Boolean) as Market[];
+      const validMarkets = markets.filter(Boolean) as Market[];
+      
+      if (validMarkets.length < marketIds.length) {
+        marketLogger.warn(
+          { expected: marketIds.length, found: validMarkets.length },
+          'Some markets could not be retrieved'
+        );
+      }
+      
+      return validMarkets;
     } catch (error) {
-      console.error('Error getting markets:', error);
-      return [];
+      throw new AppError({
+        message: 'Failed to retrieve markets',
+        context: 'market-store',
+        code: 'MARKET_LIST_ERROR',
+        originalError: error instanceof Error ? error : new Error(String(error))
+      }).log();
     }
   },
 
@@ -48,8 +66,18 @@ export const marketStore: IMarketStore = {
       const market = await kvStore.getEntity<Market>('MARKET', id);
       return market || undefined;
     } catch (error) {
-      console.error(`Error getting market ${id}:`, error);
-      return undefined;
+      if (error instanceof AppError) {
+        // Just rethrow AppErrors
+        throw error;
+      } else {
+        throw new AppError({
+          message: `Failed to retrieve market ${id}`,
+          context: 'market-store',
+          code: 'MARKET_GET_ERROR',
+          originalError: error instanceof Error ? error : new Error(String(error)),
+          data: { marketId: id }
+        }).log();
+      }
     }
   },
 
@@ -67,6 +95,22 @@ export const marketStore: IMarketStore = {
         }
   ): Promise<Market> {
     try {
+      // Validate required fields
+      if (!data.name || !data.description || !data.outcomes || data.outcomes.length === 0) {
+        throw new AppError({
+          message: 'Missing required market data',
+          context: 'market-store',
+          code: 'MARKET_VALIDATION_ERROR',
+          data: { 
+            hasName: !!data.name, 
+            hasDescription: !!data.description,
+            outcomeCount: data.outcomes?.length || 0
+          }
+        }).log();
+      }
+      
+      // Start a transaction for atomic operation
+      const tx = await kvStore.startTransaction();
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
 
@@ -87,20 +131,43 @@ export const marketStore: IMarketStore = {
       };
 
       // Store market by ID
-      await kvStore.storeEntity('MARKET', id, market);
+      await tx.addEntity('MARKET', id, market);
 
       // Add to market_ids set
-      await kvStore.addToSet('MARKET_IDS', '', id);
+      await tx.addToSetInTransaction('MARKET_IDS', '', id);
 
       // Add to user's markets set
       if (data.createdBy) {
-        await kvStore.addToSet('USER_MARKETS', data.createdBy, id);
+        await tx.addToSetInTransaction('USER_MARKETS', data.createdBy, id);
+      }
+      
+      // Execute the transaction
+      const success = await tx.execute();
+      
+      if (!success) {
+        throw new AppError({
+          message: 'Failed to create market - transaction failed',
+          context: 'market-store',
+          code: 'MARKET_CREATE_TRANSACTION_ERROR',
+          data: { marketId: id }
+        }).log();
       }
 
+      marketLogger.info({ marketId: id }, `Created new market: ${market.name}`);
       return market;
     } catch (error) {
-      console.error('Error creating market:', error);
-      throw error;
+      if (error instanceof AppError) {
+        // Just rethrow AppErrors
+        throw error;
+      } else {
+        throw new AppError({
+          message: 'Failed to create market',
+          context: 'market-store',
+          code: 'MARKET_CREATE_ERROR',
+          originalError: error instanceof Error ? error : new Error(String(error)),
+          data: { marketName: data.name }
+        }).log();
+      }
     }
   },
 
@@ -108,17 +175,45 @@ export const marketStore: IMarketStore = {
   async updateMarket(id: string, marketData: Partial<Market>): Promise<Market | undefined> {
     try {
       const market = await this.getMarket(id);
-      if (!market) return undefined;
+      if (!market) {
+        marketLogger.warn({ marketId: id }, `Cannot update non-existent market with ID ${id}`);
+        return undefined;
+      }
+      
+      // Ensure we don't change critical fields like ID
+      const safeData = { ...marketData };
+      if (safeData.id && safeData.id !== id) {
+        delete safeData.id;
+        marketLogger.warn(
+          { marketId: id, attemptedId: marketData.id }, 
+          'Attempted to change market ID during update - ignoring'
+        );
+      }
 
-      const updatedMarket = { ...market, ...marketData };
+      const updatedMarket = { ...market, ...safeData };
 
       // Store the updated market
       await kvStore.storeEntity('MARKET', id, updatedMarket);
+      
+      marketLogger.debug(
+        { marketId: id }, 
+        `Updated market: ${market.name}`
+      );
 
       return updatedMarket;
     } catch (error) {
-      console.error(`Error updating market ${id}:`, error);
-      return undefined;
+      if (error instanceof AppError) {
+        // Just rethrow AppErrors
+        throw error;
+      } else {
+        throw new AppError({
+          message: `Failed to update market ${id}`,
+          context: 'market-store',
+          code: 'MARKET_UPDATE_ERROR',
+          originalError: error instanceof Error ? error : new Error(String(error)),
+          data: { marketId: id }
+        }).log();
+      }
     }
   },
 
@@ -243,6 +338,16 @@ export const marketStore: IMarketStore = {
         predictions?: Record<string, unknown>[];
     }> {
     try {
+      // Set up structured logging for this operation
+      const opLogger = marketLogger.child({ 
+        operation: 'resolveMarket',
+        marketId, 
+        winningOutcomeId, 
+        adminId 
+      });
+      
+      opLogger.info({}, 'Starting market resolution process');
+      
       // Get services from registry
       const predictionStore = getPredictionStore();
       const userStatsStore = getUserStatsStore();
@@ -252,25 +357,64 @@ export const marketStore: IMarketStore = {
       // First, get the market - this needs to be done outside the transaction to verify it exists
       const market = await this.getMarket(marketId);
       if (!market) {
-        return { success: false, error: 'Market not found' };
+        const error = new AppError({
+          message: `Market not found: ${marketId}`,
+          context: 'market-store',
+          code: 'MARKET_RESOLUTION_ERROR',
+          data: { marketId }
+        }).log();
+        
+        return { success: false, error: error.message };
       }
 
       // Check if market is already resolved
       if (market.resolvedOutcomeId !== undefined) {
-        return { success: false, error: 'Market is already resolved' };
+        const error = new AppError({
+          message: `Market ${marketId} is already resolved`,
+          context: 'market-store',
+          code: 'MARKET_ALREADY_RESOLVED',
+          data: { 
+            marketId,
+            currentOutcomeId: market.resolvedOutcomeId,
+            attemptedOutcomeId: winningOutcomeId 
+          }
+        }).log();
+        
+        return { success: false, error: error.message };
       }
 
       // Find the winning outcome
       const winningOutcome = market.outcomes.find(o => o.id === winningOutcomeId);
       if (!winningOutcome) {
-        return { success: false, error: 'Winning outcome not found' };
+        const error = new AppError({
+          message: `Winning outcome ${winningOutcomeId} not found in market ${marketId}`,
+          context: 'market-store',
+          code: 'INVALID_OUTCOME_ID',
+          data: { 
+            marketId,
+            winningOutcomeId,
+            availableOutcomes: market.outcomes.map(o => o.id)
+          }
+        }).log();
+        
+        return { success: false, error: error.message };
       }
 
       // Get all predictions for this market - needs to be done before transaction starts
       const marketPredictions = await predictionStore.getMarketPredictions(market.id);
       if (marketPredictions.length === 0) {
+        opLogger.warn(
+          { marketId }, 
+          'No predictions found for this market, cannot resolve'
+        );
+        
         return { success: false, error: 'No predictions found for this market' };
       }
+
+      opLogger.info(
+        { predictionCount: marketPredictions.length },
+        `Processing ${marketPredictions.length} predictions for market resolution`
+      );
 
       // Calculate total pot and admin fee (5%)
       const totalPot = marketPredictions.reduce((sum, prediction) => sum + prediction.amount, 0);
@@ -286,6 +430,17 @@ export const marketStore: IMarketStore = {
       const totalWinningAmount = winningPredictions.reduce(
         (sum, prediction) => sum + prediction.amount,
         0
+      );
+      
+      opLogger.info(
+        { 
+          totalPot, 
+          adminFee, 
+          remainingPot, 
+          winningPredictions: winningPredictions.length,
+          totalWinningAmount 
+        },
+        'Market payout calculations completed'
       );
       
       // Create updated market object with resolved status
@@ -321,96 +476,164 @@ export const marketStore: IMarketStore = {
         };
       });
       
+      opLogger.info({}, 'Starting transaction for market resolution');
+      
       // Start a transaction
       const tx = await startTransaction();
       
-      // Within the transaction:
-      
-      // 1. Double-check the market is not already resolved (critical safety check)
-      // We'll need to get the market again, but inside the transaction
-      // This is handled by our atomic transaction - the entire transaction will fail
-      // if any command fails or if the market has been modified
-      
-      // 2. Update the market
-      await tx.addEntity('MARKET', marketId, updatedMarket);
-      
-      // 3. Update the user balance for admin (fee)
-      const userBalance = await userBalanceStore.getUserBalance(adminId);
-      if (userBalance) {
-        const updatedBalance = {
-          ...userBalance,
-          availableBalance: userBalance.availableBalance + adminFee,
-          totalDeposited: userBalance.totalDeposited + adminFee,
-          lastUpdated: new Date().toISOString()
-        };
-        await tx.addEntity('USER_BALANCE', adminId, updatedBalance);
-      }
-      
-      // 4. Update all predictions
-      for (const updatedPrediction of updatedPredictions) {
-        await tx.addEntity('PREDICTION', updatedPrediction.id, updatedPrediction);
-      }
-      
-      // 5. Update user stats
-      for (const prediction of marketPredictions) {
-        const isWinner = prediction.outcomeId === winningOutcomeId;
-        const winnerShare = isWinner && totalWinningAmount > 0
-          ? (prediction.amount / totalWinningAmount) * remainingPot
-          : 0;
-          
-        const userStats = await userStatsStore.getUserStats(prediction.userId);
-        if (userStats) {
-          const updatedStats = {
-            ...userStats,
-            correctPredictions: isWinner
-              ? userStats.correctPredictions + 1
-              : userStats.correctPredictions,
-            totalEarnings: userStats.totalEarnings + (isWinner ? winnerShare : -prediction.amount),
+      try {
+        // Within the transaction:
+        
+        // 1. Double-check the market is not already resolved (critical safety check)
+        // We'll need to get the market again, but inside the transaction
+        // This is handled by our atomic transaction - the entire transaction will fail
+        // if any command fails or if the market has been modified
+        
+        // 2. Update the market
+        await tx.addEntity('MARKET', marketId, updatedMarket);
+        opLogger.debug({}, 'Added market update to transaction');
+        
+        // 3. Update the user balance for admin (fee)
+        const userBalance = await userBalanceStore.getUserBalance(adminId);
+        if (userBalance) {
+          const updatedBalance = {
+            ...userBalance,
+            availableBalance: userBalance.availableBalance + adminFee,
+            totalDeposited: userBalance.totalDeposited + adminFee,
             lastUpdated: new Date().toISOString()
           };
-          
-          // Recalculate accuracy
-          updatedStats.accuracy = updatedStats.totalPredictions > 0
-            ? (updatedStats.correctPredictions / updatedStats.totalPredictions) * 100
+          await tx.addEntity('USER_BALANCE', adminId, updatedBalance);
+          opLogger.debug({}, 'Added admin balance update to transaction');
+        } else {
+          opLogger.warn(
+            { adminId }, 
+            'Admin user balance not found, skipping fee distribution'
+          );
+        }
+        
+        // 4. Update all predictions
+        for (const updatedPrediction of updatedPredictions) {
+          await tx.addEntity('PREDICTION', updatedPrediction.id, updatedPrediction);
+        }
+        opLogger.debug(
+          { count: updatedPredictions.length }, 
+          'Added prediction updates to transaction'
+        );
+        
+        // 5. Update user stats
+        let userStatsUpdated = 0;
+        for (const prediction of marketPredictions) {
+          const isWinner = prediction.outcomeId === winningOutcomeId;
+          const winnerShare = isWinner && totalWinningAmount > 0
+            ? (prediction.amount / totalWinningAmount) * remainingPot
             : 0;
             
-          await tx.addEntity('USER_STATS', prediction.userId, updatedStats);
-          
-          // Update leaderboard entries
-          const accuracyScore = updatedStats.totalPredictions >= 5 ? updatedStats.accuracy : 0;
-          await tx.addToSortedSetInTransaction('LEADERBOARD_EARNINGS', prediction.userId, updatedStats.totalEarnings);
-          await tx.addToSortedSetInTransaction('LEADERBOARD_ACCURACY', prediction.userId, accuracyScore);
-          
-          // Calculate composite score for leaderboard
-          // This is simplified - in production you'd use the real algorithm
-          const compositeScore = (accuracyScore * 0.5) + (updatedStats.totalEarnings * 0.5);
-          await tx.addToSortedSetInTransaction('LEADERBOARD', prediction.userId, compositeScore);
+          const userStats = await userStatsStore.getUserStats(prediction.userId);
+          if (userStats) {
+            const updatedStats = {
+              ...userStats,
+              correctPredictions: isWinner
+                ? userStats.correctPredictions + 1
+                : userStats.correctPredictions,
+              totalEarnings: userStats.totalEarnings + (isWinner ? winnerShare : -prediction.amount),
+              lastUpdated: new Date().toISOString()
+            };
+            
+            // Recalculate accuracy
+            updatedStats.accuracy = updatedStats.totalPredictions > 0
+              ? (updatedStats.correctPredictions / updatedStats.totalPredictions) * 100
+              : 0;
+              
+            await tx.addEntity('USER_STATS', prediction.userId, updatedStats);
+            
+            // Update leaderboard entries
+            const accuracyScore = updatedStats.totalPredictions >= 5 ? updatedStats.accuracy : 0;
+            await tx.addToSortedSetInTransaction('LEADERBOARD_EARNINGS', prediction.userId, updatedStats.totalEarnings);
+            await tx.addToSortedSetInTransaction('LEADERBOARD_ACCURACY', prediction.userId, accuracyScore);
+            
+            // Calculate composite score for leaderboard
+            // This is simplified - in production you'd use the real algorithm
+            const compositeScore = (accuracyScore * 0.5) + (updatedStats.totalEarnings * 0.5);
+            await tx.addToSortedSetInTransaction('LEADERBOARD', prediction.userId, compositeScore);
+            
+            userStatsUpdated++;
+          } else {
+            opLogger.warn(
+              { userId: prediction.userId }, 
+              'User stats not found for participant, skipping stats update'
+            );
+          }
         }
+        
+        opLogger.debug(
+          { updated: userStatsUpdated, total: marketPredictions.length }, 
+          'Added user stats updates to transaction'
+        );
+        
+        // Execute the transaction
+        opLogger.info(
+          { operationCount: tx.operations.length }, 
+          'Executing transaction with all updates'
+        );
+        
+        const success = await tx.execute();
+        
+        if (!success) {
+          throw new AppError({
+            message: 'Transaction failed during market resolution',
+            context: 'market-store',
+            code: 'TRANSACTION_EXECUTION_FAILED',
+            data: { marketId, operationCount: tx.operations.length }
+          });
+        }
+        
+        opLogger.info(
+          { marketId, winningOutcomeId },
+          'Market successfully resolved'
+        );
+        
+        return {
+          success: true,
+          market: updatedMarket,
+          adminFee: adminFee,
+          predictions: updatedPredictions
+        };
+      } catch (error) {
+        // If any operation fails, throw a structured error
+        throw new AppError({
+          message: 'Error during transaction preparation',
+          context: 'market-store',
+          code: 'RESOLUTION_TRANSACTION_ERROR',
+          originalError: error instanceof Error ? error : new Error(String(error)),
+          data: { marketId, winningOutcomeId }
+        });
       }
-      
-      // Execute the transaction
-      const success = await tx.execute();
-      
-      if (!success) {
-        return { success: false, error: 'Transaction failed' };
-      }
-      
-      return {
-        success: true,
-        market: updatedMarket,
-        adminFee: adminFee,
-        predictions: updatedPredictions
-      };
     } catch (error) {
-      console.error('Error resolving market with payouts:', error);
-      return { success: false, error: 'Failed to resolve market' };
+      // Return a friendly error to the caller
+      const appError = error instanceof AppError 
+        ? error
+        : new AppError({
+            message: 'Failed to resolve market',
+            context: 'market-store',
+            code: 'MARKET_RESOLUTION_ERROR',
+            originalError: error instanceof Error ? error : new Error(String(error)),
+            data: { marketId, winningOutcomeId }
+          });
+      
+      // Log the error but return a user-friendly message
+      appError.log();
+      
+      return { 
+        success: false, 
+        error: appError.message
+      };
     }
   },
 
   // Create sample markets for testing
   async createSampleMarkets(): Promise<void> {
     try {
-      console.log('Creating sample markets...');
+      marketLogger.info({}, 'Creating sample markets...');
 
       const sampleMarkets = [
         {
@@ -446,7 +669,10 @@ export const marketStore: IMarketStore = {
       ];
 
       // Create each sample market
-      console.log(`Creating ${sampleMarkets.length} sample markets...`);
+      marketLogger.info(
+        { marketCount: sampleMarkets.length }, 
+        `Creating ${sampleMarkets.length} sample markets...`
+      );
 
       for (const marketData of sampleMarkets) {
         try {
@@ -456,15 +682,27 @@ export const marketStore: IMarketStore = {
             category: 'general',
             endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
           });
-          console.log(`Created sample market: ${market.id} - ${market.name}`);
-        } catch (marketError) {
-          console.error(`Error creating sample market: ${marketData.name}`, marketError);
+          marketLogger.info(
+            { marketId: market.id }, 
+            `Created sample market: ${market.name}`
+          );
+        } catch (error) {
+          // Already handled and logged by createMarket, no need to rethrow
+          marketLogger.error(
+            { marketName: marketData.name },
+            `Error creating sample market: ${marketData.name}`
+          );
         }
       }
 
-      console.log('Sample markets creation completed');
+      marketLogger.info({}, 'Sample markets creation completed');
     } catch (error) {
-      console.error('Error creating sample markets:', error);
+      throw new AppError({
+        message: 'Failed to create sample markets',
+        context: 'market-store',
+        code: 'SAMPLE_MARKET_ERROR',
+        originalError: error instanceof Error ? error : new Error(String(error))
+      }).log();
     }
   },
 };

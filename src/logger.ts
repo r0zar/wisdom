@@ -14,31 +14,73 @@ export interface Logger {
  * context and standardized error handling.
  */
 
-// Import type dynamically to avoid direct require
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const pino = require('pino');
-
-// Create a logger factory
+// Simple console-based logger factory - no external dependencies
 const createLogger = (): Logger => {
-  try {
-    // Use imported pino module
-    return pino({
-      level: process.env.LOG_LEVEL || 'info',
-      base: { service: 'wisdom-sdk' },
-    });
-  } catch (e) {
-    // Fallback logger implementation
-    return {
-      info: (obj: Record<string, unknown>, msg?: string) => console.info(msg || '', obj),
-      error: (obj: Record<string, unknown>, msg?: string) => console.error(msg || '', obj),
-      warn: (obj: Record<string, unknown>, msg?: string) => console.warn(msg || '', obj),
-      debug: (obj: Record<string, unknown>, msg?: string) => console.debug(msg || '', obj),
-      child: (bindings: object) => {
-        console.info('Creating child logger with bindings:', bindings);
-        return createLogger();
+  // Get log level from environment or default to 'info'
+  const logLevel = process.env.LOG_LEVEL || 'info';
+  
+  // Map log levels to numeric values for comparison
+  const logLevels = {
+    debug: 0,
+    info: 1,
+    warn: 2,
+    error: 3
+  } as const;
+  
+  // Current log level
+  const currentLevelValue = logLevel in logLevels 
+    ? logLevels[logLevel as keyof typeof logLevels] 
+    : logLevels.info;
+  
+  // Format a log message with timestamp and metadata
+  const formatLog = (level: string, obj: Record<string, unknown>, msg?: string): string => {
+    const timestamp = new Date().toISOString();
+    const service = 'wisdom-sdk';
+    const objStr = JSON.stringify(obj);
+    return `[${timestamp}] ${level.toUpperCase()} [${service}] ${msg || ''} ${objStr}`;
+  };
+  
+  // Simple implementation using console methods
+  return {
+    debug: (obj: Record<string, unknown>, msg?: string) => {
+      if (currentLevelValue <= 0) { // debug level
+        console.debug(formatLog('debug', obj, msg));
       }
-    };
-  }
+    },
+    info: (obj: Record<string, unknown>, msg?: string) => {
+      if (currentLevelValue <= 1) { // info level
+        console.info(formatLog('info', obj, msg));
+      }
+    },
+    warn: (obj: Record<string, unknown>, msg?: string) => {
+      if (currentLevelValue <= 2) { // warn level
+        console.warn(formatLog('warn', obj, msg));
+      }
+    },
+    error: (obj: Record<string, unknown>, msg?: string) => {
+      if (currentLevelValue <= 3) { // error level
+        console.error(formatLog('error', obj, msg));
+      }
+    },
+    child: (bindings: object) => {
+      // For child loggers, we merge the bindings with the log objects
+      const childLogger = createLogger();
+      
+      // Override methods to include the bindings
+      return {
+        debug: (obj: Record<string, unknown>, msg?: string) => 
+          childLogger.debug({ ...obj, ...bindings }, msg),
+        info: (obj: Record<string, unknown>, msg?: string) => 
+          childLogger.info({ ...obj, ...bindings }, msg),
+        warn: (obj: Record<string, unknown>, msg?: string) => 
+          childLogger.warn({ ...obj, ...bindings }, msg),
+        error: (obj: Record<string, unknown>, msg?: string) => 
+          childLogger.error({ ...obj, ...bindings }, msg),
+        child: (nestedBindings: object) => 
+          childLogger.child({ ...bindings, ...nestedBindings })
+      };
+    }
+  };
 };
 
 // Default logger instance

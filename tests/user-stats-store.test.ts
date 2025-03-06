@@ -20,9 +20,9 @@ describe('User Stats Store', () => {
     expect(typeof userStatsStore.getUserStats).toBe('function');
     expect(typeof userStatsStore.updateStatsForNewPrediction).toBe('function');
     expect(typeof userStatsStore.updateStatsForResolvedPrediction).toBe('function');
-    expect(typeof userStatsStore.getLeaderboard).toBe('function');
+    expect(typeof userStatsStore.getTopUsers).toBe('function');
     expect(typeof userStatsStore.getTopEarners).toBe('function');
-    expect(typeof userStatsStore.getTopAccuracy).toBe('function');
+    expect(typeof userStatsStore.getTopAccurate).toBe('function');
   });
 
   it('should calculate user score correctly', () => {

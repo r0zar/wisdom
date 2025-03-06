@@ -213,7 +213,7 @@ export const userStatsStore: IUserStatsStore = {
   },
 
   // Get top leaderboard entries by accuracy
-  async getTopAccuracy(limit: number = 10): Promise<LeaderboardEntry[]> {
+  async getTopAccurate(limit: number = 10): Promise<LeaderboardEntry[]> {
     try {
       // Get top user IDs sorted by accuracy (highest first)
       const userIds = await kvStore.getTopFromSortedSet('LEADERBOARD_ACCURACY', limit);
@@ -239,7 +239,7 @@ export const userStatsStore: IUserStatsStore = {
   },
 
   // Get top leaderboard entries by combined score
-  async getLeaderboard(limit: number = 10): Promise<LeaderboardEntry[]> {
+  async getTopUsers(limit: number = 10): Promise<LeaderboardEntry[]> {
     try {
       // Get top user IDs sorted by combined score (highest first)
       const userIds = await kvStore.getTopFromSortedSet('LEADERBOARD', limit);

@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.0] - 2025-03-04
+
+### Added
+- Standardized error handling across all store modules
+- Improved error tracking with structured error messages
+- Transaction tracking for KV store operations
+
+### Changed
+- Enhanced type safety across all store modules
+- Fixed method signatures to match interfaces consistently
+- Renamed methods for better clarity and consistency
+- Updated error handling to use AppError class throughout
+- Improved error messages with more context and details
+
+### Fixed
+- Type discrepancies between interfaces and implementations
+- Missing methods in service interfaces
+- Inconsistent method naming conventions
+
 ## [2.0.0] - 2023-03-04
 
 ### Added

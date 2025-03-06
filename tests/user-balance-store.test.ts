@@ -15,7 +15,7 @@ describe('User Balance Store', () => {
 
   it('should have required methods', () => {
     expect(typeof userBalanceStore.getUserBalance).toBe('function');
-    expect(typeof userBalanceStore.initializeUserBalance).toBe('function');
+    expect(typeof userBalanceStore.createUserBalance).toBe('function');
     expect(typeof userBalanceStore.updateBalanceForPrediction).toBe('function');
     expect(typeof userBalanceStore.updateBalanceForResolvedPrediction).toBe('function');
     expect(typeof userBalanceStore.addFunds).toBe('function');
@@ -27,7 +27,7 @@ describe('User Balance Store', () => {
     const mockUserId = 'user123';
     vi.mocked(kvStore.storeEntity).mockResolvedValueOnce({ userId: mockUserId } as any);
     
-    const result = await userBalanceStore.initializeUserBalance(mockUserId);
+    const result = await userBalanceStore.createUserBalance(mockUserId);
     
     expect(result).toHaveProperty('userId', mockUserId);
     expect(result).toHaveProperty('availableBalance', 1000);

@@ -1,4 +1,5 @@
 import { kv } from '@vercel/kv';
+import { AppError, logger } from './logger.js';
 
 /**
  * Centralized KV Store Helper
@@ -8,6 +9,9 @@ import { kv } from '@vercel/kv';
  * 
  * Also provides transaction support to ensure data consistency for complex operations.
  */
+
+// Create a logger instance for this module
+const kvLogger = logger.child({ context: 'kv-store' });
 
 // Define constant prefixes for all entity types
 export const KV_PREFIXES = {
@@ -55,8 +59,13 @@ export async function storeEntity<T>(entityType: EntityType, id: string, data: T
     await kv.set(key, JSON.stringify(data));
     return data;
   } catch (error) {
-    console.error(`Error storing ${entityType} with ID ${id}:`, error);
-    throw error;
+    throw new AppError({
+      message: `Failed to store ${entityType} with ID ${id}`,
+      context: 'kv-store',
+      code: 'KV_STORE_ERROR',
+      originalError: error instanceof Error ? error : new Error(String(error)),
+      data: { entityType, id, operation: 'store' }
+    }).log();
   }
 }
 
@@ -75,6 +84,8 @@ export async function getEntity<T>(entityType: EntityType, id: string): Promise<
     }
 
     if (!data) {
+      // Not an error, just not found
+      kvLogger.debug({ entityType, id }, `Entity not found: ${entityType}:${id}`);
       return null;
     }
 
@@ -87,12 +98,27 @@ export async function getEntity<T>(entityType: EntityType, id: string): Promise<
     try {
       return JSON.parse(data) as T;
     } catch (e) {
-      console.error(`Error parsing JSON for ${entityType} with ID ${id}:`, e);
-      return null;
+      throw new AppError({
+        message: `Error parsing JSON for ${entityType} with ID ${id}`,
+        context: 'kv-store',
+        code: 'KV_JSON_PARSE_ERROR',
+        originalError: e instanceof Error ? e : new Error(String(e)),
+        data: { entityType, id, operation: 'parse' }
+      }).log();
     }
   } catch (error) {
-    console.error(`Error getting ${entityType} with ID ${id}:`, error);
-    return null;
+    // Only throw AppError if it's not already one
+    if (error instanceof AppError) {
+      throw error;
+    }
+    
+    throw new AppError({
+      message: `Failed to retrieve ${entityType} with ID ${id}`,
+      context: 'kv-store',
+      code: 'KV_RETRIEVE_ERROR',
+      originalError: error instanceof Error ? error : new Error(String(error)),
+      data: { entityType, id, operation: 'get' }
+    }).log();
   }
 }
 
@@ -111,7 +137,15 @@ export async function deleteEntity(entityType: EntityType, id: string): Promise<
 
     return true;
   } catch (error) {
-    console.error(`Error deleting ${entityType} with ID ${id}:`, error);
+    // Log error but don't throw - deletion errors are often non-critical
+    new AppError({
+      message: `Failed to delete ${entityType} with ID ${id}`,
+      context: 'kv-store',
+      code: 'KV_DELETE_ERROR',
+      originalError: error instanceof Error ? error : new Error(String(error)),
+      data: { entityType, id, operation: 'delete' }
+    }).log();
+    
     return false;
   }
 }
@@ -131,7 +165,14 @@ export async function addToSet(setType: EntityType, id: string, memberId: string
 
     return true;
   } catch (error) {
-    console.error(`Error adding to set ${setType} with ID ${id}:`, error);
+    new AppError({
+      message: `Failed to add member ${memberId} to set ${setType}:${id}`,
+      context: 'kv-store',
+      code: 'KV_SET_ADD_ERROR',
+      originalError: error instanceof Error ? error : new Error(String(error)),
+      data: { setType, id, memberId, operation: 'sadd' }
+    }).log();
+    
     return false;
   }
 }
@@ -151,7 +192,14 @@ export async function removeFromSet(setType: EntityType, id: string, memberId: s
 
     return true;
   } catch (error) {
-    console.error(`Error removing from set ${setType} with ID ${id}:`, error);
+    new AppError({
+      message: `Failed to remove member ${memberId} from set ${setType}:${id}`,
+      context: 'kv-store',
+      code: 'KV_SET_REMOVE_ERROR',
+      originalError: error instanceof Error ? error : new Error(String(error)),
+      data: { setType, id, memberId, operation: 'srem' }
+    }).log();
+    
     return false;
   }
 }
@@ -178,7 +226,14 @@ export async function getSetMembers(setType: EntityType, id: string): Promise<st
 
     return members;
   } catch (error) {
-    console.error(`Error getting members from set ${setType} with ID ${id}:`, error);
+    new AppError({
+      message: `Failed to get members from set ${setType}:${id}`,
+      context: 'kv-store',
+      code: 'KV_SET_MEMBERS_ERROR',
+      originalError: error instanceof Error ? error : new Error(String(error)),
+      data: { setType, id, operation: 'smembers' }
+    }).log();
+    
     return [];
   }
 }
@@ -328,27 +383,53 @@ export async function getDebugInfo(): Promise<Record<string, unknown>> {
 }
 
 /**
+ * Transaction interface for atomic operations
+ */
+export interface KvTransaction {
+  operations: Array<{
+    type: 'entity' | 'set' | 'sortedSet';
+    entityType: EntityType;
+    id: string;
+    data?: unknown;
+  }>;
+  addEntity<T>(entityType: EntityType, id: string, data: T): Promise<void>;
+  addToSetInTransaction(setType: EntityType, id: string, memberId: string): Promise<void>;
+  addToSortedSetInTransaction(setType: EntityType, memberId: string, score: number): Promise<void>;
+  execute(): Promise<boolean>;
+}
+
+/**
  * Start a Redis transaction for atomic operations
  * @returns A transaction object with methods that queue commands to be executed atomically
  */
-export async function startTransaction() {
+export async function startTransaction(): Promise<KvTransaction> {
   try {
     // @vercel/kv supports Redis transactions via the multi() method
     const transaction = kv.multi();
     
-    return {
-      transaction,
+    // Track operations for potential rollback planning
+    const operations: Array<{
+      type: 'entity' | 'set' | 'sortedSet';
+      entityType: EntityType;
+      id: string;
+      data?: unknown;
+    }> = [];
+    
+    const txObject: KvTransaction = {
+      operations,
       
       // Add entity to transaction
       async addEntity<T>(entityType: EntityType, id: string, data: T): Promise<void> {
         const key = getKey(entityType, id);
         transaction.set(key, JSON.stringify(data));
+        operations.push({ type: 'entity', entityType, id, data });
       },
       
       // Add to set in transaction
       async addToSetInTransaction(setType: EntityType, id: string, memberId: string): Promise<void> {
         const key = getKey(setType, id);
         transaction.sadd(key, memberId);
+        operations.push({ type: 'set', entityType: setType, id: memberId });
         
         // Handle backward compatibility if needed
         if (setType === 'MARKET_IDS') {
@@ -360,21 +441,45 @@ export async function startTransaction() {
       async addToSortedSetInTransaction(setType: EntityType, memberId: string, score: number): Promise<void> {
         const key = getKey(setType);
         transaction.zadd(key, { score, member: memberId });
+        operations.push({ type: 'sortedSet', entityType: setType, id: memberId, data: score });
       },
       
       // Execute all queued commands atomically
       async execute(): Promise<boolean> {
         try {
+          kvLogger.debug(
+            { operationCount: operations.length }, 
+            `Executing transaction with ${operations.length} operations`
+          );
+          
           await transaction.exec();
           return true;
         } catch (error) {
-          console.error('Error executing transaction:', error);
+          const appError = new AppError({
+            message: 'Transaction execution failed',
+            context: 'kv-store',
+            code: 'TRANSACTION_FAILED',
+            originalError: error instanceof Error ? error : new Error(String(error)),
+            data: { operationCount: operations.length }
+          });
+          
+          appError.log();
+          
+          // Note: Redis transactions are atomic - they either all succeed or all fail
+          // No manual rollback is needed as failed transactions don't apply any changes
+          
           return false;
         }
       }
     };
+    
+    return txObject;
   } catch (error) {
-    console.error('Error starting transaction:', error);
-    throw error;
+    throw new AppError({
+      message: 'Failed to start transaction',
+      context: 'kv-store',
+      code: 'TRANSACTION_START_ERROR',
+      originalError: error instanceof Error ? error : new Error(String(error))
+    }).log();
   }
 }
