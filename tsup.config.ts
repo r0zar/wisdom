@@ -1,8 +1,6 @@
 import { defineConfig } from 'tsup';
-import fs from 'fs';
-import path from 'path';
 
-// Create entry point files for each store module
+// Store modules to build
 const storeModules = [
   'market-store',
   'prediction-store',
@@ -14,24 +12,13 @@ const storeModules = [
   'logger'
 ];
 
-// Create entry files dynamically
-storeModules.forEach(module => {
-  const entryFile = path.join('src', `${module}.entry.ts`);
-  if (!fs.existsSync(entryFile)) {
-    fs.writeFileSync(
-      entryFile,
-      `// Entry point for ${module} subpath export\nexport * from './${module}.js';\n`
-    );
-  }
-});
-
-// Build entry configuration
+// Build entry configuration - use direct file paths
 const entries = {
   'index': 'src/index.ts',
   ...Object.fromEntries(
     storeModules.map(module => [
       module, 
-      `src/${module}.entry.ts`
+      `src/${module}.ts`
     ])
   )
 };

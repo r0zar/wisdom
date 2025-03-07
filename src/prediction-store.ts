@@ -1,33 +1,24 @@
-import * as kvStore from './kv-store.js';
-import crypto from 'crypto';
-import { 
-  Prediction, 
-  PredictionNFTReceipt,
-  IPredictionStore,
-  Market
-} from './types.js';
-import {
-  getMarketStore,
-  getUserBalanceStore,
-  getUserStatsStore
-} from './services.js';
-import { isAdmin } from './utils.js';
-import { AppError, logger } from './logger.js';
+import * as kvStore from './kv-store';
+import { isAdmin, generateUUID } from './utils';
+import { AppError, logger } from './logger';
+import { marketStore } from './market-store';
+import { userBalanceStore } from './user-balance-store';
+import { userStatsStore } from './user-stats-store';
 
 // Create a logger instance for this module
 const predictionLogger = logger.child({ context: 'prediction-store' });
 
 // Prediction store with Vercel KV
-export const predictionStore: IPredictionStore = {
+export const predictionStore = {
   // Create a new prediction
   async createPrediction(data: {
-        marketId: string;
-        marketName: string;
-        outcomeId: number;
-        outcomeName: string;
-        userId: string;
-        amount: number;
-    }): Promise<Prediction> {
+    marketId: string;
+    marketName: string;
+    outcomeId: number;
+    outcomeName: string;
+    userId: string;
+    amount: number;
+  }) {
     try {
       // Validate input
       if (!data.marketId || !data.userId || data.amount <= 0) {
@@ -35,15 +26,15 @@ export const predictionStore: IPredictionStore = {
           message: 'Invalid prediction data',
           context: 'prediction-store',
           code: 'PREDICTION_VALIDATION_ERROR',
-          data: { 
-            hasMarketId: !!data.marketId, 
+          data: {
+            hasMarketId: !!data.marketId,
             hasUserId: !!data.userId,
             amount: data.amount
           }
         }).log();
       }
-      
-      const id = crypto.randomUUID();
+
+      const id = generateUUID();
       const now = new Date().toISOString();
 
       predictionLogger.debug(
@@ -52,8 +43,8 @@ export const predictionStore: IPredictionStore = {
       );
 
       // Generate NFT receipt
-      const nftReceipt: PredictionNFTReceipt = {
-        id: crypto.randomUUID(),
+      const nftReceipt = {
+        id: generateUUID(),
         tokenId: `${data.marketId}-${data.userId}-${now}`,
         image: this.generateNftImage(data.marketName, data.outcomeName, data.amount),
         predictionId: id,
@@ -64,7 +55,7 @@ export const predictionStore: IPredictionStore = {
       };
 
       // Create the prediction
-      const prediction: Prediction = {
+      const prediction = {
         id,
         marketId: data.marketId,
         outcomeId: data.outcomeId,
@@ -78,17 +69,17 @@ export const predictionStore: IPredictionStore = {
 
       // Start a transaction for atomic operation
       const tx = await kvStore.startTransaction();
-      
+
       try {
         // Add all operations to the transaction
         await tx.addEntity('PREDICTION', id, prediction);
         await tx.addEntity('PREDICTION_NFT', nftReceipt.id, nftReceipt);
         await tx.addToSetInTransaction('USER_PREDICTIONS', data.userId, id);
         await tx.addToSetInTransaction('MARKET_PREDICTIONS', data.marketId, id);
-        
+
         // Execute the transaction
         const success = await tx.execute();
-        
+
         if (!success) {
           throw new AppError({
             message: 'Failed to create prediction - transaction failed',
@@ -97,22 +88,21 @@ export const predictionStore: IPredictionStore = {
             data: { predictionId: id }
           }).log();
         }
-        
+
         // Update market stats separately since it requires accessing the market store
         // This is not included in the transaction since it involves another store
-        const marketStore = getMarketStore();
         await marketStore.updateMarketStats(
-          data.marketId, 
-          data.outcomeId, 
-          data.amount, 
+          data.marketId,
+          data.outcomeId,
+          data.amount,
           data.userId
         );
-        
+
         predictionLogger.info(
-          { predictionId: id, userId: data.userId }, 
+          { predictionId: id, userId: data.userId },
           'Prediction created successfully'
         );
-        
+
         return prediction;
       } catch (error) {
         // Rethrow AppErrors, wrap others
@@ -137,8 +127,8 @@ export const predictionStore: IPredictionStore = {
           context: 'prediction-store',
           code: 'PREDICTION_CREATE_ERROR',
           originalError: error instanceof Error ? error : new Error(String(error)),
-          data: { 
-            marketId: data.marketId, 
+          data: {
+            marketId: data.marketId,
             userId: data.userId,
             amount: data.amount
           }
@@ -148,7 +138,7 @@ export const predictionStore: IPredictionStore = {
   },
 
   // Get all predictions for a user
-  async getUserPredictions(userId: string): Promise<Prediction[]> {
+  async getUserPredictions(userId: string) {
     try {
       if (!userId) return [];
 
@@ -165,7 +155,7 @@ export const predictionStore: IPredictionStore = {
       );
 
       // Filter out any undefined predictions (in case of data inconsistency)
-      return predictions.filter(Boolean) as Prediction[];
+      return predictions.filter(Boolean);
     } catch (error) {
       console.error('Error getting user predictions:', error);
       return [];
@@ -173,7 +163,7 @@ export const predictionStore: IPredictionStore = {
   },
 
   // Get all predictions for a market
-  async getMarketPredictions(marketId: string): Promise<Prediction[]> {
+  async getMarketPredictions(marketId: string) {
     try {
       if (!marketId) return [];
 
@@ -190,7 +180,7 @@ export const predictionStore: IPredictionStore = {
       );
 
       // Filter out any undefined predictions (in case of data inconsistency)
-      return predictions.filter(Boolean) as Prediction[];
+      return predictions.filter(Boolean);
     } catch (error) {
       console.error('Error getting market predictions:', error);
       return [];
@@ -198,11 +188,11 @@ export const predictionStore: IPredictionStore = {
   },
 
   // Get a specific prediction by ID
-  async getPrediction(id: string): Promise<Prediction | undefined> {
+  async getPrediction(id: string) {
     try {
       if (!id) return undefined;
 
-      const prediction = await kvStore.getEntity<Prediction>('PREDICTION', id);
+      const prediction = await kvStore.getEntity('PREDICTION', id);
       return prediction || undefined;
     } catch (error) {
       console.error(`Error getting prediction ${id}:`, error);
@@ -211,11 +201,11 @@ export const predictionStore: IPredictionStore = {
   },
 
   // Get a specific NFT receipt
-  async getNFTReceipt(id: string): Promise<PredictionNFTReceipt | undefined> {
+  async getNFTReceipt(id: string) {
     try {
       if (!id) return undefined;
 
-      const receipt = await kvStore.getEntity<PredictionNFTReceipt>('PREDICTION_NFT', id);
+      const receipt = await kvStore.getEntity('PREDICTION_NFT', id);
       return receipt || undefined;
     } catch (error) {
       console.error(`Error getting NFT receipt ${id}:`, error);
@@ -227,7 +217,7 @@ export const predictionStore: IPredictionStore = {
   async updatePredictionStatus(
     id: string,
     status: 'active' | 'won' | 'lost' | 'redeemed' | 'cancelled'
-  ): Promise<Prediction | undefined> {
+  ) {
     try {
       const prediction = await this.getPrediction(id);
       if (!prediction) return undefined;
@@ -268,7 +258,7 @@ export const predictionStore: IPredictionStore = {
     // Convert SVG to a data URI
     return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
   },
-    
+
   /**
      * Create a prediction with balance update
      * This function handles the complete process of:
@@ -281,17 +271,17 @@ export const predictionStore: IPredictionStore = {
      * @returns Object with created prediction or error message
      */
   async createPredictionWithBalanceUpdate(data: {
-        marketId: string;
-        outcomeId: number;
-        userId: string;
-        amount: number;
-    }): Promise<{
-        success: boolean;
-        prediction?: Prediction;
-        error?: string;
-        market?: Record<string, unknown>;
-        outcomeName?: string;
-    }> {
+    marketId: string;
+    outcomeId: number;
+    userId: string;
+    amount: number;
+  }): Promise<{
+    success: boolean;
+    prediction?: any;
+    error?: string;
+    market?: Record<string, unknown>;
+    outcomeName?: string;
+  }> {
     try {
       // Set up structured logging for this operation
       const opLogger = predictionLogger.child({
@@ -300,9 +290,9 @@ export const predictionStore: IPredictionStore = {
         userId: data.userId,
         amount: data.amount
       });
-      
+
       opLogger.info({}, 'Starting prediction creation with balance update');
-      
+
       // Input validation
       if (!data.marketId || !data.userId || data.amount <= 0) {
         const error = new AppError({
@@ -315,17 +305,12 @@ export const predictionStore: IPredictionStore = {
             amount: data.amount
           }
         }).log();
-        
+
         return { success: false, error: error.message };
       }
-      
-      // Get services from registry
-      const marketStore = getMarketStore();
-      const userBalanceStore = getUserBalanceStore();
-      const userStatsStore = getUserStatsStore();
-            
+
       // Get the market to verify it exists and get outcome name
-      const market = await marketStore.getMarket(data.marketId);
+      const market: any = await marketStore.getMarket(data.marketId);
       if (!market) {
         const error = new AppError({
           message: `Market not found: ${data.marketId}`,
@@ -333,24 +318,24 @@ export const predictionStore: IPredictionStore = {
           code: 'MARKET_NOT_FOUND',
           data: { marketId: data.marketId }
         }).log();
-        
+
         return { success: false, error: error.message };
       }
 
       // Find the outcome
-      const outcome = market.outcomes.find(o => o.id === data.outcomeId);
+      const outcome = market.outcomes.find((o: any) => o.id === data.outcomeId);
       if (!outcome) {
         const error = new AppError({
           message: `Outcome ${data.outcomeId} not found in market ${data.marketId}`,
           context: 'prediction-store',
           code: 'OUTCOME_NOT_FOUND',
-          data: { 
-            marketId: data.marketId, 
+          data: {
+            marketId: data.marketId,
             outcomeId: data.outcomeId,
-            availableOutcomes: market.outcomes.map(o => o.id) 
+            availableOutcomes: market.outcomes.map((o: any) => o.id)
           }
         }).log();
-        
+
         return { success: false, error: error.message };
       }
 
@@ -360,12 +345,12 @@ export const predictionStore: IPredictionStore = {
           message: `Market ${data.marketId} is already resolved`,
           context: 'prediction-store',
           code: 'MARKET_ALREADY_RESOLVED',
-          data: { 
+          data: {
             marketId: data.marketId,
             resolvedOutcomeId: market.resolvedOutcomeId
           }
         }).log();
-        
+
         return { success: false, error: error.message };
       }
 
@@ -375,25 +360,25 @@ export const predictionStore: IPredictionStore = {
           message: `Market ${data.marketId} has ended`,
           context: 'prediction-store',
           code: 'MARKET_ENDED',
-          data: { 
-            marketId: data.marketId, 
+          data: {
+            marketId: data.marketId,
             endDate: market.endDate,
             currentDate: new Date().toISOString()
           }
         }).log();
-        
+
         return { success: false, error: error.message };
       }
 
       opLogger.debug({}, 'Market validation completed, processing balance update');
-      
+
       // Deduct the amount from user's balance
       try {
         const balanceResult = await userBalanceStore.updateBalanceForPrediction(
           data.userId,
           data.amount
         );
-  
+
         if (!balanceResult) {
           throw new AppError({
             message: 'Failed to update user balance',
@@ -402,12 +387,12 @@ export const predictionStore: IPredictionStore = {
             data: { userId: data.userId, amount: data.amount }
           });
         }
-        
+
         opLogger.debug({}, 'Balance updated successfully, creating prediction');
       } catch (balanceError) {
         // Handle insufficient balance case specifically
-        if (balanceError instanceof Error && 
-            balanceError.message.includes('Insufficient balance')) {
+        if (balanceError instanceof Error &&
+          balanceError.message.includes('Insufficient balance')) {
           const error = new AppError({
             message: 'Insufficient balance. Please add more funds to your account.',
             context: 'prediction-store',
@@ -415,10 +400,10 @@ export const predictionStore: IPredictionStore = {
             originalError: balanceError,
             data: { userId: data.userId, amount: data.amount }
           }).log();
-          
+
           return { success: false, error: error.message };
         }
-        
+
         // Rethrow other errors
         throw balanceError;
       }
@@ -434,21 +419,21 @@ export const predictionStore: IPredictionStore = {
       });
 
       opLogger.debug(
-        { predictionId: prediction.id }, 
+        { predictionId: prediction.id },
         'Prediction created, updating user stats'
       );
-      
+
       // Update user stats for leaderboard tracking
       await userStatsStore.updateStatsForNewPrediction(data.userId, prediction);
 
       opLogger.info(
-        { predictionId: prediction.id }, 
+        { predictionId: prediction.id },
         'Prediction with balance update completed successfully'
       );
-      
+
       // Convert market to Record<string, unknown> to comply with return type
       const marketData: Record<string, unknown> = { ...market };
-      
+
       return {
         success: true,
         prediction,
@@ -461,20 +446,20 @@ export const predictionStore: IPredictionStore = {
         error.log();
         return { success: false, error: error.message };
       }
-      
+
       // Handle other errors
       const appError = new AppError({
         message: 'Failed to create prediction',
         context: 'prediction-store',
         code: 'PREDICTION_CREATE_ERROR',
         originalError: error instanceof Error ? error : new Error(String(error)),
-        data: { 
-          marketId: data.marketId, 
-          userId: data.userId, 
-          amount: data.amount 
+        data: {
+          marketId: data.marketId,
+          userId: data.userId,
+          amount: data.amount
         }
       }).log();
-      
+
       return { success: false, error: appError.message };
     }
   },
@@ -485,7 +470,7 @@ export const predictionStore: IPredictionStore = {
       if (!predictionId) return false;
 
       // Get the prediction to retrieve its data
-      const prediction = await this.getPrediction(predictionId);
+      const prediction: any = await this.getPrediction(predictionId);
       if (!prediction) return false;
 
       // Delete from the main predictions store
@@ -512,7 +497,7 @@ export const predictionStore: IPredictionStore = {
   /**
      * Update a prediction with new data
      */
-  async updatePrediction(predictionId: string, data: Partial<Prediction>): Promise<Prediction | null> {
+  async updatePrediction(predictionId: string, data: any) {
     try {
       // Get existing prediction
       const prediction = await this.getPrediction(predictionId);
@@ -521,7 +506,7 @@ export const predictionStore: IPredictionStore = {
       }
 
       // Update prediction data
-      const updatedPrediction: Prediction = {
+      const updatedPrediction = {
         ...prediction,
         ...data,
       };
@@ -544,17 +529,17 @@ export const predictionStore: IPredictionStore = {
      * @returns Validation result with prediction if successful
      */
   async validateRedemptionEligibility(
-    predictionId: string, 
+    predictionId: string,
     userId: string
   ): Promise<{
-        success: boolean;
-        prediction?: Prediction;
-        error?: string;
-        isAdmin?: boolean;
-    }> {
+    success: boolean;
+    prediction?: any;
+    error?: string;
+    isAdmin?: boolean;
+  }> {
     try {
       // Get prediction
-      const prediction = await this.getPrediction(predictionId);
+      const prediction: any = await this.getPrediction(predictionId);
       if (!prediction) {
         return { success: false, error: 'Prediction not found' };
       }
@@ -577,10 +562,10 @@ export const predictionStore: IPredictionStore = {
         return { success: false, error: 'Prediction is not eligible for redemption yet' };
       }
 
-      return { 
-        success: true, 
+      return {
+        success: true,
         prediction,
-        isAdmin: userIsAdmin 
+        isAdmin: userIsAdmin
       };
     } catch (error) {
       console.error(`Error validating redemption eligibility for prediction ${predictionId}:`, error);
@@ -603,11 +588,11 @@ export const predictionStore: IPredictionStore = {
     predictionId: string,
     userId: string
   ): Promise<{
-        success: boolean;
-        prediction?: Prediction;
-        payout?: number;
-        error?: string;
-    }> {
+    success: boolean;
+    prediction?: any;
+    payout?: number;
+    error?: string;
+  }> {
     try {
       // First validate eligibility
       const validationResult = await this.validateRedemptionEligibility(predictionId, userId);
@@ -629,9 +614,6 @@ export const predictionStore: IPredictionStore = {
       if (!updatedPrediction) {
         return { success: false, error: 'Failed to update prediction' };
       }
-
-      // Get userBalanceStore from registry
-      const userBalanceStore = getUserBalanceStore();
 
       // Update user's balance
       if (payout > 0) {
@@ -666,12 +648,12 @@ export const predictionStore: IPredictionStore = {
      * redeemPredictionWithBalanceUpdate for new code
      */
   async redeemPrediction(predictionId: string): Promise<{
-        prediction: Prediction | null;
-        payout: number;
-    }> {
+    prediction: any;
+    payout: number;
+  }> {
     try {
       // Get prediction
-      const prediction = await this.getPrediction(predictionId);
+      const prediction: any = await this.getPrediction(predictionId);
       if (!prediction) {
         return { prediction: null, payout: 0 };
       }
@@ -708,10 +690,10 @@ export const predictionStore: IPredictionStore = {
   /**
      * Get all predictions for a specific market with a specific status
      */
-  async getMarketPredictionsByStatus(marketId: string, status: string): Promise<Prediction[]> {
+  async getMarketPredictionsByStatus(marketId: string, status: string) {
     try {
       const predictions = await this.getMarketPredictions(marketId);
-      return predictions.filter(p => p.status === status);
+      return predictions.filter((p: any) => p.status === status);
     } catch (error) {
       console.error(`Error getting market predictions by status for market ${marketId}:`, error);
       return [];

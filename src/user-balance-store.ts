@@ -1,17 +1,16 @@
-import * as kvStore from './kv-store.js';
-import { UserBalance, IUserBalanceStore } from './types.js';
+import * as kvStore from './kv-store';
 
 // Default starting balance for new users
 const DEFAULT_STARTING_BALANCE = 1000;
 
 // User balance store with Vercel KV
-export const userBalanceStore: IUserBalanceStore = {
+export const userBalanceStore = {
   // Get user balance for a specific user
-  async getUserBalance(userId: string): Promise<UserBalance | null> {
+  async getUserBalance(userId: string) {
     try {
       if (!userId) return null;
 
-      let balance = await kvStore.getEntity<UserBalance>('USER_BALANCE', userId);
+      let balance = await kvStore.getEntity('USER_BALANCE', userId);
 
       // If no balance exists, initialize with default balance
       if (!balance) {
@@ -26,9 +25,9 @@ export const userBalanceStore: IUserBalanceStore = {
   },
 
   // Initialize a new user with default balance
-  async createUserBalance(userId: string): Promise<UserBalance> {
+  async createUserBalance(userId: string) {
     try {
-      const newBalance: UserBalance = {
+      const newBalance = {
         userId,
         availableBalance: DEFAULT_STARTING_BALANCE,
         totalDeposited: DEFAULT_STARTING_BALANCE, // Initial $1000 counts as a deposit
@@ -46,9 +45,9 @@ export const userBalanceStore: IUserBalanceStore = {
   },
 
   // Update user balance when making a prediction
-  async updateBalanceForPrediction(userId: string, amount: number): Promise<UserBalance | null> {
+  async updateBalanceForPrediction(userId: string, amount: number) {
     try {
-      const balance = await this.getUserBalance(userId);
+      const balance: any = await this.getUserBalance(userId);
       if (!balance) return null;
 
       // Check if user has enough balance
@@ -56,7 +55,7 @@ export const userBalanceStore: IUserBalanceStore = {
         throw new Error('Insufficient balance');
       }
 
-      const updatedBalance: UserBalance = {
+      const updatedBalance = {
         ...balance,
         availableBalance: balance.availableBalance - amount,
         inPredictions: balance.inPredictions + amount,
@@ -76,12 +75,12 @@ export const userBalanceStore: IUserBalanceStore = {
     userId: string,
     originalAmount: number,
     winnings: number = 0
-  ): Promise<UserBalance | null> {
+  ) {
     try {
-      const balance = await this.getUserBalance(userId);
+      const balance: any = await this.getUserBalance(userId);
       if (!balance) return null;
 
-      const updatedBalance: UserBalance = {
+      const updatedBalance = {
         ...balance,
         availableBalance: balance.availableBalance + winnings,
         inPredictions: balance.inPredictions - originalAmount,
@@ -97,12 +96,12 @@ export const userBalanceStore: IUserBalanceStore = {
   },
 
   // Add funds to user balance (for deposit functionality)
-  async addFunds(userId: string, amount: number): Promise<UserBalance | null> {
+  async addFunds(userId: string, amount: number) {
     try {
-      const balance = await this.getUserBalance(userId);
+      const balance: any = await this.getUserBalance(userId);
       if (!balance) return null;
 
-      const updatedBalance: UserBalance = {
+      const updatedBalance = {
         ...balance,
         availableBalance: balance.availableBalance + amount,
         totalDeposited: balance.totalDeposited + amount,
@@ -118,9 +117,9 @@ export const userBalanceStore: IUserBalanceStore = {
   },
 
   // Withdraw funds from user balance
-  async withdrawFunds(userId: string, amount: number): Promise<UserBalance | null> {
+  async withdrawFunds(userId: string, amount: number) {
     try {
-      const balance = await this.getUserBalance(userId);
+      const balance: any = await this.getUserBalance(userId);
       if (!balance) return null;
 
       // Check if user has enough balance
@@ -128,7 +127,7 @@ export const userBalanceStore: IUserBalanceStore = {
         throw new Error('Insufficient balance');
       }
 
-      const updatedBalance: UserBalance = {
+      const updatedBalance = {
         ...balance,
         availableBalance: balance.availableBalance - amount,
         totalWithdrawn: balance.totalWithdrawn + amount,

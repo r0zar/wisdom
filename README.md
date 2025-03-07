@@ -14,6 +14,8 @@ pnpm add wisdom-sdk
 
 ## Usage
 
+### Basic Operations
+
 ```typescript
 // Import the entire library
 import { marketStore, predictionStore } from 'wisdom-sdk';
@@ -43,11 +45,57 @@ const prediction = await predictionStore.createPrediction({
 });
 ```
 
+### Market Search and Query
+
+```typescript
+import { marketStore, MarketQueryOptions } from 'wisdom-sdk';
+
+// Find active markets in the crypto category with pagination
+const queryOptions: MarketQueryOptions = {
+  status: 'active',
+  category: 'crypto',
+  limit: 20,
+  sortBy: 'createdAt',
+  sortDirection: 'desc'
+};
+
+const result = await marketStore.getMarkets(queryOptions);
+console.log(`Found ${result.total} markets, showing ${result.items.length}`);
+
+// Search for markets containing specific terms
+const searchResult = await marketStore.searchMarkets('bitcoin price', {
+  status: 'active',
+  limit: 10
+});
+
+// Get markets by category with automatic sorting
+const cryptoMarkets = await marketStore.getMarketsByCategory('crypto', {
+  sortBy: 'poolAmount',
+  sortDirection: 'desc'
+});
+
+// Find trending markets (highest pool amount)
+const trendingMarkets = await marketStore.getTrendingMarkets(5);
+
+// Get related markets
+const relatedMarkets = await marketStore.getRelatedMarkets('market-id', 3);
+
+// Load more results with cursor-based pagination
+if (result.hasMore && result.nextCursor) {
+  const nextPage = await marketStore.getMarkets({
+    ...queryOptions,
+    cursor: result.nextCursor
+  });
+}
+```
+
 ## Features
 
 - TypeScript-first design with full type safety
 - Data access layer with Vercel KV store integration
 - Support for prediction markets, user balances, and stats
+- Advanced market search and filtering capabilities
+- Pagination, sorting, and efficient data retrieval
 - Built for both ESM and CommonJS environments
 - Structured logging and error handling
 - Tree-shakable modules for optimal bundle size
@@ -68,6 +116,12 @@ The library is organized into independent modules that can be imported separatel
 ## Documentation
 
 For detailed API documentation, see the GitHub repository at [github.com/r0zar/wisdom](https://github.com/r0zar/wisdom).
+
+### Reference Implementations
+
+We provide reference implementations to help you build robust UIs with the Wisdom SDK:
+
+- **[Markets Datatable Reference](/docs/MARKET_DATATABLE_REFERENCE.md)** - A comprehensive implementation of a paginated datatable with sorting, filtering, and analytics for markets
 
 ## Development
 

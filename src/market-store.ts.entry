@@ -1,2 +1,0 @@
-// Entry point for market-store subpath export
-export * from './market-store.js';

@@ -1,44 +1,40 @@
 // Export all public API
 
-// Type definitions
-export * from './types.js';
-
-// Service registry
-export * from './services.js';
-
 // KV Store
-export * from './kv-store.js';
-
-// Import and initialize all services to register them
-import { marketStore } from './market-store.js';
-import { predictionStore } from './prediction-store.js';
-import { userStatsStore } from './user-stats-store.js';
-import { userBalanceStore } from './user-balance-store.js';
-import { bugReportStore } from './bug-report-store.js';
-
-// Register services with the service registry
-import { 
-  registerMarketStore,
-  registerPredictionStore,
-  registerUserStatsStore,
-  registerUserBalanceStore,
-  registerBugReportStore
-} from './services.js';
-
-// Initialize all services
-registerMarketStore(marketStore);
-registerPredictionStore(predictionStore);
-registerUserStatsStore(userStatsStore);
-registerUserBalanceStore(userBalanceStore);
-registerBugReportStore(bugReportStore);
+export * from './kv-store';
 
 // Export individual stores for convenience
-export { marketStore } from './market-store.js';
-export { predictionStore } from './prediction-store.js';
-export { userStatsStore } from './user-stats-store.js';
-export { userBalanceStore } from './user-balance-store.js';
-export { bugReportStore } from './bug-report-store.js';
+export { marketStore } from './market-store';
+export { predictionStore } from './prediction-store';
+export { userStatsStore } from './user-stats-store';
+export { userBalanceStore } from './user-balance-store';
+export { bugReportStore } from './bug-report-store';
 
 // Utilities
-export * from './utils.js';
-export * from './logger.js';
+export * from './utils';
+export * from './logger';
+
+// Re-export store types for better IntelliSense
+export type * from './market-store';
+export type * from './prediction-store';
+export type * from './user-stats-store';
+export type * from './user-balance-store';
+export type * from './bug-report-store';
+
+// Export query types
+export type {
+  MarketQueryOptions,
+  PaginatedResult,
+  MarketStatus,
+  MarketType,
+  SortField,
+  SortDirection
+} from './utils';
+
+// Export query functions
+export {
+  filterMarkets,
+  sortMarkets,
+  paginateResults,
+  searchMarketText
+} from './utils';

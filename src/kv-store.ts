@@ -1,5 +1,5 @@
 import { kv } from '@vercel/kv';
-import { AppError, logger } from './logger.js';
+import { AppError, logger } from './logger';
 
 /**
  * Centralized KV Store Helper
@@ -19,6 +19,8 @@ export const KV_PREFIXES = {
   MARKET_IDS: 'market_ids',
   USER_MARKETS: 'user_markets',
   MARKET_PARTICIPANTS: 'market_participants',
+  MARKET_CATEGORY: 'market_category',  // Index for markets by category
+  MARKET_STATUS: 'market_status',      // Index for markets by status
   PREDICTION: 'prediction',
   USER_PREDICTIONS: 'user_predictions',
   MARKET_PREDICTIONS: 'market_predictions',

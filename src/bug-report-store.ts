@@ -1,8 +1,7 @@
-import * as kvStore from './kv-store.js';
-import crypto from 'crypto';
-import { BugReport, IBugReportStore } from './types.js';
-import { getUserBalanceStore } from './services.js';
-import { AppError, logger } from './logger.js';
+import * as kvStore from './kv-store';
+import { generateUUID } from './utils';
+import { AppError, logger } from './logger';
+import { userBalanceStore } from './user-balance-store';
 
 // Create a logger instance for this module
 const bugReportLogger = logger.child({ context: 'bug-report-store' });
@@ -11,11 +10,11 @@ const bugReportLogger = logger.child({ context: 'bug-report-store' });
 const DEFAULT_INITIAL_REWARD = 10;
 const DEFAULT_CONFIRMATION_REWARD = 90;
 
-export class BugReportStore implements IBugReportStore {
+export class BugReportStore {
   /**
    * Get all bug reports
    */
-  async getAllBugReports(): Promise<BugReport[]> {
+  async getAllBugReports() {
     try {
       // Get all bug report IDs
       const reportIds = await kvStore.getSetMembers('BUG_REPORT_IDS', '');
@@ -27,12 +26,12 @@ export class BugReportStore implements IBugReportStore {
       // Get all bug reports
       const reports = await Promise.all(
         reportIds.map(async (id) => {
-          const report = await kvStore.getEntity<BugReport>('BUG_REPORT', id);
+          const report = await kvStore.getEntity('BUG_REPORT', id);
           return report;
         })
       );
 
-      return reports.filter((report): report is BugReport => report !== null);
+      return reports.filter((report) => report !== null);
     } catch (error) {
       throw new AppError({
         message: 'Failed to retrieve bug reports',
@@ -46,54 +45,44 @@ export class BugReportStore implements IBugReportStore {
   /**
    * Get specific bug report by ID
    */
-  async getBugReport(id: string): Promise<BugReport | null> {
-    try {
-      if (!id) {
-        bugReportLogger.warn({}, 'Attempted to get bug report with empty ID');
-        return null;
-      }
-      
-      const report = await kvStore.getEntity<BugReport>('BUG_REPORT', id);
-      
-      if (!report) {
-        bugReportLogger.debug({ reportId: id }, `Bug report ${id} not found`);
-      }
-      
-      return report;
-    } catch (error) {
-      throw new AppError({
-        message: `Failed to retrieve bug report ${id}`,
-        context: 'bug-report-store',
-        code: 'BUG_REPORT_GET_ERROR',
-        originalError: error instanceof Error ? error : new Error(String(error)),
-        data: { reportId: id }
-      }).log();
+  async getBugReport(id: string) {
+    if (!id) {
+      bugReportLogger.warn({}, 'Attempted to get bug report with empty ID');
+      return null;
     }
+
+    const report: any = await kvStore.getEntity('BUG_REPORT', id);
+
+    if (!report) {
+      bugReportLogger.debug({ reportId: id }, `Bug report ${id} not found`);
+    }
+
+    return report;
   }
 
   /**
    * Get all bug reports for a specific user
    */
-  async getUserBugReports(userId: string): Promise<BugReport[]> {
+  async getUserBugReports(userId: string) {
     try {
       if (!userId) {
         return [];
       }
-      
+
       // Get the user's bug report IDs
       const reportIds = await kvStore.getSetMembers('USER_BUG_REPORTS', userId);
-      
+
       if (reportIds.length === 0) {
         return [];
       }
-      
+
       // Get all bug reports
       const reports = await Promise.all(
         reportIds.map(id => this.getBugReport(id))
       );
-      
+
       // Filter out any null reports (in case of data inconsistency)
-      return reports.filter((report): report is BugReport => report !== null);
+      return reports.filter((report) => report !== null);
     } catch (error) {
       throw new AppError({
         message: `Failed to retrieve bug reports for user ${userId}`,
@@ -114,7 +103,7 @@ export class BugReportStore implements IBugReportStore {
     severity: string;
     url?: string;
     createdBy: string;
-  }): Promise<BugReport> {
+  }) {
     try {
       // Validate required fields
       if (!data.title || !data.description || !data.createdBy) {
@@ -129,12 +118,12 @@ export class BugReportStore implements IBugReportStore {
           }
         }).log();
       }
-      
-      const id = crypto.randomUUID();
+
+      const id = generateUUID();
       const now = new Date().toISOString();
-      
+
       // Construct complete bug report with defaults
-      const bugReport: BugReport = {
+      const bugReport = {
         id,
         title: data.title,
         description: data.description,
@@ -147,16 +136,16 @@ export class BugReportStore implements IBugReportStore {
 
       // Start transaction for atomic operation
       const tx = await kvStore.startTransaction();
-      
+
       try {
         // Add all operations to transaction
         await tx.addEntity('BUG_REPORT', id, bugReport);
         await tx.addToSetInTransaction('BUG_REPORT_IDS', '', id);
         await tx.addToSetInTransaction('USER_BUG_REPORTS', data.createdBy, id);
-        
+
         // Execute transaction
         const success = await tx.execute();
-        
+
         if (!success) {
           throw new AppError({
             message: 'Failed to create bug report - transaction failed',
@@ -165,12 +154,12 @@ export class BugReportStore implements IBugReportStore {
             data: { reportId: id }
           }).log();
         }
-        
+
         bugReportLogger.info(
-          { reportId: id, userId: data.createdBy }, 
+          { reportId: id, userId: data.createdBy },
           `Bug report created: ${data.title}`
         );
-        
+
         return bugReport;
       } catch (error) {
         if (error instanceof AppError) {
@@ -203,25 +192,25 @@ export class BugReportStore implements IBugReportStore {
   /**
    * Update an existing bug report
    */
-  async updateBugReport(id: string, data: Partial<BugReport>): Promise<BugReport | null> {
+  async updateBugReport(id: string, data: any) {
     try {
       const existingReport = await this.getBugReport(id);
       if (!existingReport) {
         bugReportLogger.warn({ reportId: id }, `Cannot update non-existent bug report with ID ${id}`);
         return null;
       }
-      
+
       // Ensure we don't change critical fields like ID
       const safeData = { ...data };
       if (safeData.id && safeData.id !== id) {
         delete safeData.id;
         bugReportLogger.warn(
-          { reportId: id, attemptedId: data.id }, 
+          { reportId: id, attemptedId: data.id },
           'Attempted to change bug report ID during update - ignoring'
         );
       }
 
-      const updatedReport: BugReport = {
+      const updatedReport = {
         ...existingReport,
         ...safeData,
         updatedAt: new Date().toISOString()
@@ -229,9 +218,9 @@ export class BugReportStore implements IBugReportStore {
 
       // Save updated bug report
       await kvStore.storeEntity('BUG_REPORT', id, updatedReport);
-      
+
       bugReportLogger.debug(
-        { reportId: id }, 
+        { reportId: id },
         `Bug report updated: ${existingReport.title}`
       );
 
@@ -285,19 +274,19 @@ export class BugReportStore implements IBugReportStore {
    * @param id Bug report ID
    * @param adminId ID of the admin confirming the report
    */
-  async confirmBugReport(id: string, adminId: string): Promise<BugReport | null> {
+  async confirmBugReport(id: string, adminId: string) {
     try {
       const report = await this.getBugReport(id);
       if (!report) {
         bugReportLogger.warn({ reportId: id }, `Cannot confirm non-existent bug report: ${id}`);
         return null;
       }
-      
+
       if (report.status === 'resolved') {
         bugReportLogger.warn({ reportId: id }, `Bug report ${id} is already resolved`);
         return report;
       }
-      
+
       const now = new Date().toISOString();
       const updatedReport = await this.updateBugReport(id, {
         status: 'resolved' as const,
@@ -306,12 +295,12 @@ export class BugReportStore implements IBugReportStore {
         updatedBy: adminId,
         updatedAt: now
       });
-      
+
       bugReportLogger.info(
-        { reportId: id, adminId }, 
+        { reportId: id, adminId },
         `Bug report confirmed: ${report.title}`
       );
-      
+
       return updatedReport;
     } catch (error) {
       throw new AppError({
@@ -323,13 +312,13 @@ export class BugReportStore implements IBugReportStore {
       }).log();
     }
   }
-  
+
   /**
    * Pay a reward for a bug report
    * @param id Bug report ID
    * @param isInitialReward Whether to pay the initial (true) or confirmation (false) reward
    */
-  async payReward(id: string, isInitialReward: boolean): Promise<BugReport | null> {
+  async payReward(id: string, isInitialReward: boolean) {
     try {
       // Get the bug report
       const report = await this.getBugReport(id);
@@ -337,28 +326,28 @@ export class BugReportStore implements IBugReportStore {
         bugReportLogger.warn({ reportId: id }, `Cannot pay reward for non-existent bug report: ${id}`);
         return null;
       }
-      
+
       // Determine recipient and reward type
       const recipientId = report.createdBy;
       const rewardType = isInitialReward ? 'initial' : 'confirmation';
-      
+
       // Process the payment through the internal method
       const result = await this.processRewardPayment(id, recipientId, rewardType);
-      
+
       if (!result.success) {
         throw new AppError({
           message: result.error || 'Failed to pay reward',
           context: 'bug-report-store',
           code: 'REWARD_PAYMENT_FAILED',
-          data: { 
-            reportId: id, 
-            userId: recipientId, 
+          data: {
+            reportId: id,
+            userId: recipientId,
             rewardType,
-            error: result.error 
+            error: result.error
           }
         });
       }
-      
+
       return result.report || null;
     } catch (error) {
       if (error instanceof AppError) {
@@ -374,7 +363,7 @@ export class BugReportStore implements IBugReportStore {
       }
     }
   }
-  
+
   /**
    * Internal helper method to process reward payments
    * This handles giving the initial or confirmation reward to a user
@@ -385,11 +374,11 @@ export class BugReportStore implements IBugReportStore {
     rewardType: 'initial' | 'confirmation',
     customAmount?: number
   ): Promise<{
-        success: boolean;
-        amount?: number;
-        error?: string;
-        report?: BugReport;
-    }> {
+    success: boolean;
+    amount?: number;
+    error?: string;
+    report?: any;
+  }> {
     try {
       const opLogger = bugReportLogger.child({
         operation: 'processRewardPayment',
@@ -397,11 +386,8 @@ export class BugReportStore implements IBugReportStore {
         userId,
         rewardType
       });
-      
+
       opLogger.info({}, `Processing ${rewardType} reward payment`);
-      
-      // Get userBalanceStore from registry
-      const userBalanceStore = getUserBalanceStore();
 
       // Get the bug report
       const report = await this.getBugReport(reportId);
@@ -411,7 +397,7 @@ export class BugReportStore implements IBugReportStore {
 
       // Determine the reward amount
       const amount = customAmount ||
-                (rewardType === 'initial' ? DEFAULT_INITIAL_REWARD : DEFAULT_CONFIRMATION_REWARD);
+        (rewardType === 'initial' ? DEFAULT_INITIAL_REWARD : DEFAULT_CONFIRMATION_REWARD);
 
       // Check if reward has already been paid
       if (rewardType === 'initial' && report.initialRewardPaid) {
@@ -433,7 +419,7 @@ export class BugReportStore implements IBugReportStore {
       }
 
       opLogger.debug({ amount }, `Processing payment of ${amount} tokens`);
-      
+
       // Process the payment
       const updatedBalance = await userBalanceStore.addFunds(userId, amount);
 
@@ -447,7 +433,7 @@ export class BugReportStore implements IBugReportStore {
       }
 
       // Update the bug report to reflect the paid reward
-      const updateData: Partial<BugReport> = {};
+      const updateData: any = {};
       if (rewardType === 'initial') {
         updateData.initialRewardPaid = true;
       } else {
@@ -469,9 +455,9 @@ export class BugReportStore implements IBugReportStore {
           data: { reportId, rewardType }
         });
       }
-      
+
       opLogger.info(
-        { amount, reportId, userId }, 
+        { amount, reportId, userId },
         `Successfully processed ${rewardType} reward payment`
       );
 
@@ -492,7 +478,7 @@ export class BugReportStore implements IBugReportStore {
           originalError: error instanceof Error ? error : new Error(String(error)),
           data: { reportId, userId, rewardType }
         }).log();
-        
+
         return { success: false, error: appError.message };
       }
     }
