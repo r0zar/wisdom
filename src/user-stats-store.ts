@@ -88,7 +88,7 @@ export const userStatsStore = {
     try {
       // Handle anonymous/test users specially
       if (!userId || userId === 'anonymous') {
-        console.log(`Skipping stats update for anonymous user`);
+        console.log('Skipping stats update for anonymous user');
         return {
           userId,
           totalPredictions: 1,

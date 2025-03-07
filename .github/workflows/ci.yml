@@ -48,7 +48,7 @@ jobs:
         run: pnpm typecheck
         
       - name: Lint
-        run: pnpm lint || echo "Linting issues found, but continuing..."  # Don't fail the build for linting issues
+        run: pnpm lint --fix || echo "Linting issues found, but continuing..."  # Auto-fix linting issues when possible
         
       - name: Build
         run: pnpm build

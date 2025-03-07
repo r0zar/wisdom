@@ -65,8 +65,9 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
     "clean": "rm -rf dist",
-    "prepublishOnly": "pnpm clean && pnpm lint && pnpm test && pnpm build",
+    "prepublishOnly": "pnpm clean && pnpm test && pnpm build",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

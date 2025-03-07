@@ -5,9 +5,7 @@ import {
   filterMarkets, 
   sortMarkets, 
   paginateResults, 
-  PaginatedResult,
-  SortField,
-  SortDirection
+  PaginatedResult
 } from './utils';
 import { AppError, logger } from './logger';
 
@@ -320,7 +318,7 @@ export const marketStore = {
       }
       
       // Start a transaction for atomic deletion
-      const tx = await kvStore.startTransaction();
+      await kvStore.startTransaction();
       
       // Delete the market
       await kvStore.deleteEntity('MARKET', id);
