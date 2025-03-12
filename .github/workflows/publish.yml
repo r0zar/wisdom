@@ -1,13 +1,16 @@
 name: Publish to NPM
 
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
 
 jobs:
-  publish:
+  build_and_publish:
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     
     steps:
       - uses: actions/checkout@v4
@@ -44,8 +47,29 @@ jobs:
         
       - name: Test
         run: pnpm test || echo "Tests failed but continuing with publish"
+      
+      - name: Check NPM version
+        id: check_version
+        run: |
+          # Get local version from package.json
+          LOCAL_VERSION=$(node -p "require('./package.json').version")
+          echo "Local version: $LOCAL_VERSION"
+          
+          # Get published version from NPM
+          NPM_VERSION=$(npm view wisdom-sdk version 2>/dev/null || echo "0.0.0")
+          echo "NPM version: $NPM_VERSION"
+          
+          # Compare versions
+          if [ "$LOCAL_VERSION" != "$NPM_VERSION" ]; then
+            echo "NEW_VERSION=true" >> $GITHUB_OUTPUT
+            echo "New version detected: $LOCAL_VERSION (local) vs $NPM_VERSION (published)"
+          else
+            echo "NEW_VERSION=false" >> $GITHUB_OUTPUT
+            echo "No new version detected"
+          fi
         
       - name: Publish to NPM
+        if: steps.check_version.outputs.NEW_VERSION == 'true'
         run: pnpm publish --no-git-checks --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
