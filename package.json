@@ -71,6 +71,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@clerk/backend": "^1.25.1",
+    "@stacks/network": "^7.0.2",
+    "@stacks/transactions": "^7.0.5",
     "@vercel/kv": "^0.2.3",
     "pino": "^9.6.0",
     "zod": "^3.22.4"
