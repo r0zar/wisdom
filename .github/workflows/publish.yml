@@ -1,18 +1,19 @@
-name: Publish to npm
+name: Publish to NPM
 
 on:
   release:
-    types: [created, published]
+    types: [published]
+  workflow_dispatch:
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       
-      - name: Use Node.js
-        uses: actions/setup-node@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: '18.x'
           registry-url: 'https://registry.npmjs.org'
@@ -21,14 +22,13 @@ jobs:
         uses: pnpm/action-setup@v2
         with:
           version: 10.5.0
-          run_install: false
           
       - name: Get pnpm store directory
         shell: bash
         run: |
           echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
           
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         name: Setup pnpm cache
         with:
           path: ${{ env.STORE_PATH }}
@@ -45,7 +45,7 @@ jobs:
       - name: Test
         run: pnpm test || echo "Tests failed but continuing with publish"
         
-      - name: Publish to npm
+      - name: Publish to NPM
         run: pnpm publish --no-git-checks --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
