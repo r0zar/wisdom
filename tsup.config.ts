@@ -4,6 +4,7 @@ import { defineConfig } from 'tsup';
 const storeModules = [
   'market-store',
   'prediction-store',
+  'custody-store',
   'user-balance-store',
   'user-stats-store',
   'bug-report-store',
@@ -17,7 +18,7 @@ const entries = {
   'index': 'src/index.ts',
   ...Object.fromEntries(
     storeModules.map(module => [
-      module, 
+      module,
       `src/${module}.ts`
     ])
   )
