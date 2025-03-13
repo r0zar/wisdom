@@ -23,14 +23,14 @@ export interface CustodyTransaction {
   signer: string;
   type: TransactionType;
   subnetId: string;
-  
+
   // Transaction-specific data
   to?: string;
   amount?: number;
   marketId?: string | number;
   outcomeId?: number;
   receiptId?: number;
-  
+
   // Custody metadata
   id: string; // UUID for this custody record
   userId: string; // User who has custody
@@ -40,7 +40,7 @@ export interface CustodyTransaction {
   confirmedAt?: string; // When transaction was confirmed on the blockchain
   rejectedAt?: string; // When transaction was rejected
   rejectionReason?: string; // Why transaction was rejected
-  
+
   // For predictions - additional metadata
   marketName?: string;
   outcomeName?: string;
@@ -57,14 +57,14 @@ export const custodyStore = {
     signer: string;
     type: TransactionType;
     subnetId: string;
-    
+
     // Transaction-specific data
     to?: string;
     amount?: number;
     marketId?: string | number;
     outcomeId?: number;
     receiptId?: number;
-    
+
     // Custody metadata
     userId: string; // User requesting custody
   }): Promise<{
@@ -99,14 +99,14 @@ export const custodyStore = {
           code: 'TRANSACTION_ALREADY_IN_CUSTODY',
           data: {
             signature: data.signature,
-            existingCustody: existingTx[0].id
+            existingCustody: existingTx[0]?.id
           }
         }).log();
       }
 
       custodyLogger.debug(
-        { 
-          signature: data.signature.substring(0, 8) + '...', 
+        {
+          signature: data.signature.substring(0, 8) + '...',
           userId: data.userId,
           type: data.type
         },
@@ -147,7 +147,7 @@ export const custodyStore = {
             if (outcome) {
               transaction.marketName = market.name;
               transaction.outcomeName = outcome.name;
-              
+
               // Generate NFT receipt like in the prediction store
               transaction.nftReceipt = {
                 id: `${id}-nft`,
@@ -176,21 +176,21 @@ export const custodyStore = {
       try {
         // Add all operations to the transaction
         await tx.addEntity('CUSTODY_TRANSACTION', id, transaction);
-        
+
         // Add to user's custody transactions set
-        await tx.addToSetInTransaction('USER_CUSTODY_TRANSACTIONS', data.userId, id);
-        
+        await tx.addToSetInTransaction('USER_TRANSACTIONS', data.userId, id);
+
         // Add to signer's transactions set
-        await tx.addToSetInTransaction('SIGNER_CUSTODY_TRANSACTIONS', data.signer, id);
-        
+        await tx.addToSetInTransaction('SIGNER_TRANSACTIONS', data.signer, id);
+
         // For prediction transactions, also add to the market's transactions
         if (data.type === TransactionType.PREDICT && data.marketId) {
-          await tx.addToSetInTransaction('MARKET_CUSTODY_TRANSACTIONS', data.marketId.toString(), id);
+          await tx.addToSetInTransaction('MARKET_TRANSACTIONS', data.marketId.toString(), id);
         }
-        
+
         // If we have an NFT receipt, store it
         if (transaction.nftReceipt) {
-          await tx.addEntity('CUSTODY_NFT', transaction.nftReceipt.id, transaction.nftReceipt);
+          await tx.addEntity('CUSTODY_NFT_RECEIPT', transaction.nftReceipt.id, transaction.nftReceipt);
         }
 
         // Execute the transaction
@@ -265,7 +265,7 @@ export const custodyStore = {
       if (!userId) return [];
 
       // Get all transaction IDs for the user
-      const transactionIds = await kvStore.getSetMembers('USER_CUSTODY_TRANSACTIONS', userId);
+      const transactionIds = await kvStore.getSetMembers('USER_TRANSACTIONS', userId);
 
       if (transactionIds.length === 0) {
         return [];
@@ -290,7 +290,7 @@ export const custodyStore = {
       if (!signer) return [];
 
       // Get all transaction IDs for the signer
-      const transactionIds = await kvStore.getSetMembers('SIGNER_CUSTODY_TRANSACTIONS', signer);
+      const transactionIds = await kvStore.getSetMembers('SIGNER_TRANSACTIONS', signer);
 
       if (transactionIds.length === 0) {
         return [];
@@ -315,7 +315,7 @@ export const custodyStore = {
       if (!marketId) return [];
 
       // Get all transaction IDs for the market
-      const transactionIds = await kvStore.getSetMembers('MARKET_CUSTODY_TRANSACTIONS', marketId);
+      const transactionIds = await kvStore.getSetMembers('MARKET_TRANSACTIONS', marketId);
 
       if (transactionIds.length === 0) {
         return [];
@@ -352,7 +352,7 @@ export const custodyStore = {
     try {
       if (!id) return undefined;
 
-      const receipt = await kvStore.getEntity('CUSTODY_NFT', id);
+      const receipt = await kvStore.getEntity('CUSTODY_NFT_RECEIPT', id);
       return receipt || undefined;
     } catch (error) {
       custodyLogger.error({ receiptId: id, error }, 'Error getting custody NFT receipt');
@@ -373,56 +373,57 @@ export const custodyStore = {
   }): Promise<CustodyTransaction[]> {
     try {
       let transactionIds: string[] = [];
-      
+
       // Try to use the most efficient index based on criteria
       if (criteria.userId) {
         // If looking for a specific user's transactions
-        transactionIds = await kvStore.getSetMembers('USER_CUSTODY_TRANSACTIONS', criteria.userId);
+        transactionIds = await kvStore.getSetMembers('USER_TRANSACTIONS', criteria.userId);
       } else if (criteria.signer) {
         // If looking for a specific signer's transactions
-        transactionIds = await kvStore.getSetMembers('SIGNER_CUSTODY_TRANSACTIONS', criteria.signer);
+        transactionIds = await kvStore.getSetMembers('SIGNER_TRANSACTIONS', criteria.signer);
       } else if (criteria.marketId) {
         // If looking for a market's transactions
-        transactionIds = await kvStore.getSetMembers('MARKET_CUSTODY_TRANSACTIONS', criteria.marketId.toString());
+        transactionIds = await kvStore.getSetMembers('MARKET_TRANSACTIONS', criteria.marketId.toString());
       } else {
         // No efficient lookup available, so we need to scan all transactions
         // This could be very inefficient with large datasets
         // In a production environment, we'd want additional indices or a query engine
-        
+
         // For demo purposes, let's just look at all users and build a composite set
         const allUsers = await kvStore.getSetMembers('ALL_USERS', '');
-        
+
         // Get transactions for each user
         const userTransactionIds = await Promise.all(
-          allUsers.map(userId => kvStore.getSetMembers('USER_CUSTODY_TRANSACTIONS', userId))
+          allUsers.map(userId => kvStore.getSetMembers('USER_TRANSACTIONS', userId))
         );
-        
+
         // Flatten the array of arrays
         transactionIds = userTransactionIds.flat();
       }
-      
+
       if (transactionIds.length === 0) {
         return [];
       }
-      
+
       // Get all transactions in parallel
       const transactions = await Promise.all(
         transactionIds.map(id => this.getTransaction(id))
       );
-      
+
       // Filter out undefined transactions and apply criteria filter
       return transactions
         .filter(Boolean)
         .filter(tx => {
           if (!tx) return false;
-          
+
           // Check each criteria property
           for (const [key, value] of Object.entries(criteria)) {
+            //@ts-ignore
             if (tx[key] !== value) {
               return false;
             }
           }
-          
+
           return true;
         }) as CustodyTransaction[];
     } catch (error) {
@@ -443,7 +444,7 @@ export const custodyStore = {
 
       const now = new Date().toISOString();
       const updatedTransaction = { ...transaction, status };
-      
+
       // Set appropriate timestamp based on status
       if (status === 'submitted') {
         updatedTransaction.submittedAt = now;
@@ -494,19 +495,19 @@ export const custodyStore = {
       await kvStore.deleteEntity('CUSTODY_TRANSACTION', transactionId);
 
       // Remove from user's transactions set
-      await kvStore.removeFromSet('USER_CUSTODY_TRANSACTIONS', transaction.userId, transactionId);
+      await kvStore.removeFromSet('USER_TRANSACTIONS', transaction.userId, transactionId);
 
       // Remove from signer's transactions set
-      await kvStore.removeFromSet('SIGNER_CUSTODY_TRANSACTIONS', transaction.signer, transactionId);
+      await kvStore.removeFromSet('SIGNER_TRANSACTIONS', transaction.signer, transactionId);
 
       // If it's a prediction, remove from market's transactions set
       if (transaction.type === TransactionType.PREDICT && transaction.marketId) {
-        await kvStore.removeFromSet('MARKET_CUSTODY_TRANSACTIONS', transaction.marketId.toString(), transactionId);
+        await kvStore.removeFromSet('MARKET_TRANSACTIONS', transaction.marketId.toString(), transactionId);
       }
 
       // Delete the NFT receipt if it exists
       if (transaction.nftReceipt?.id) {
-        await kvStore.deleteEntity('CUSTODY_NFT', transaction.nftReceipt.id);
+        await kvStore.deleteEntity('CUSTODY_NFT_RECEIPT', transaction.nftReceipt.id);
       }
 
       return true;
@@ -551,7 +552,7 @@ export const custodyStore = {
     nonce: number;
     signer: string;
     subnetId: string;
-    
+
     // Prediction data
     marketId: string;
     outcomeId: number;

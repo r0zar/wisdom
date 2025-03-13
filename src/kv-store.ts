@@ -27,12 +27,20 @@ export const KV_PREFIXES = {
   PREDICTION_NFT: 'prediction_nft',
   USER_BALANCE: 'user_balance',
   USER_STATS: 'user_stats',
+  ALL_USERS: 'all_users', // Index of all users for global lookups
   LEADERBOARD: 'leaderboard',
   LEADERBOARD_EARNINGS: 'leaderboard_earnings',
   LEADERBOARD_ACCURACY: 'leaderboard_accuracy',
   BUG_REPORT: 'bug_report',
   BUG_REPORT_IDS: 'bug_report_ids',
-  USER_BUG_REPORTS: 'user_bug_reports'
+  USER_BUG_REPORTS: 'user_bug_reports',
+  // Transaction custody-related prefixes
+  CUSTODY_TRANSACTION: 'custody_transaction',
+  CUSTODY_TRANSACTION_IDS: 'custody_transaction_ids',
+  USER_TRANSACTIONS: 'user_transactions', 
+  SIGNER_TRANSACTIONS: 'signer_transactions',
+  MARKET_TRANSACTIONS: 'market_transactions',
+  CUSTODY_NFT_RECEIPT: 'custody_nft_receipt'
 } as const;
 
 // Type safety for valid entity types

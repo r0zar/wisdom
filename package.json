@@ -1,6 +1,6 @@
 {
   "name": "wisdom-sdk",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Core business logic and data access layer for prediction markets",
   "type": "module",
   "main": "dist/index.cjs",
@@ -21,6 +21,11 @@
       "types": "./dist/prediction-store.d.ts",
       "import": "./dist/prediction-store.js",
       "require": "./dist/prediction-store.cjs"
+    },
+    "./custody-store": {
+      "types": "./dist/custody-store.d.ts",
+      "import": "./dist/custody-store.js",
+      "require": "./dist/custody-store.cjs"
     },
     "./user-balance-store": {
       "types": "./dist/user-balance-store.d.ts",

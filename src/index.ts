@@ -9,6 +9,8 @@ export { predictionStore } from './prediction-store';
 export { userStatsStore } from './user-stats-store';
 export { userBalanceStore } from './user-balance-store';
 export { bugReportStore } from './bug-report-store';
+export { custodyStore } from './custody-store';
+
 
 // Utilities
 export * from './utils';
@@ -20,6 +22,7 @@ export type * from './prediction-store';
 export type * from './user-stats-store';
 export type * from './user-balance-store';
 export type * from './bug-report-store';
+export type * from './custody-store';
 
 // Export query types
 export type {
@@ -28,7 +31,7 @@ export type {
   MarketStatus,
   MarketType,
   SortField,
-  SortDirection
+  SortDirection,
 } from './utils';
 
 // Export query functions
