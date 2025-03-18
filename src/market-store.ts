@@ -30,6 +30,13 @@ const onChainConfig = {
   contractName: process.env.PREDICTION_CONTRACT_NAME || 'blaze-welsh-predictions-v1',
 };
 
+// Auto close configuration
+const autoCloseConfig = {
+  enabled: process.env.ENABLE_AUTO_CLOSE_MARKETS !== 'false', // Enabled by default
+  batchSize: Number(process.env.AUTO_CLOSE_BATCH_SIZE || '50'),
+  closeOnChain: process.env.AUTO_CLOSE_ON_CHAIN === 'true',
+};
+
 export interface Market {
   id: string;
   type: 'binary' | 'multiple';
@@ -691,6 +698,182 @@ export const marketStore = {
         'Error building market indexes'
       );
       return { success: false, indexed: 0 };
+    }
+  },
+
+  /**
+   * Close a market on-chain
+   * @param marketId Unique ID for the market
+   * @returns Promise resolving to the broadcast transaction result
+   */
+  async closeMarketOnChain(
+    marketId: string
+  ): Promise<TxBroadcastResult | null> {
+    try {
+      // Skip if on-chain market interaction is disabled
+      if (!onChainConfig.enabled) {
+        marketLogger.info({ marketId }, 'On-chain market close is disabled');
+        return null;
+      }
+
+      // Validate private key is available
+      if (!onChainConfig.privateKey) {
+        throw new Error('Private key is required for on-chain market close');
+      }
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: onChainConfig.contractAddress,
+        contractName: onChainConfig.contractName,
+        functionName: 'close-market',
+        functionArgs: [
+          stringAsciiCV(marketId)
+        ],
+        senderKey: onChainConfig.privateKey,
+        validateWithAbi: true,
+        network: onChainConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000,
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      marketLogger.info({
+        marketId,
+        txId: result.txid || 'unknown',
+        successful: !!result.txid
+      }, 'On-chain market close transaction broadcast');
+
+      return result;
+    } catch (error) {
+      marketLogger.error({
+        marketId,
+        error: error instanceof Error ? error.message : String(error)
+      }, 'Failed to close market on-chain');
+
+      // We don't throw here - just log the error and return null
+      return null;
+    }
+  },
+
+  /**
+   * Automatically close markets that have passed their end date
+   * This function is meant to be called by a cron job
+   * @returns Object with stats about markets that were closed
+   */
+  async autoCloseExpiredMarkets(): Promise<{
+    success: boolean;
+    processed: number;
+    closed: number;
+    errors: number;
+    onChainSucceeded?: number;
+    onChainFailed?: number;
+  }> {
+    try {
+      // Skip if auto-close is disabled
+      if (!autoCloseConfig.enabled) {
+        return { success: true, processed: 0, closed: 0, errors: 0 };
+      }
+
+      // Get active markets
+      const activeMarkets = await kvStore.getSetMembers('MARKET_STATUS', 'active');
+
+      // Initialize counters
+      let processed = 0;
+      let closed = 0;
+      let errors = 0;
+      let onChainSucceeded = 0;
+      let onChainFailed = 0;
+
+      // Current time for comparison
+      const now = new Date().toISOString();
+
+      // Process markets in batches
+      for (let i = 0; i < activeMarkets.length; i += autoCloseConfig.batchSize) {
+        const batch = activeMarkets.slice(i, i + autoCloseConfig.batchSize);
+
+        // Get market data in parallel
+        const markets = await Promise.all(
+          batch.map(id => this.getMarket(id))
+        );
+
+        // Filter for valid markets with expired end dates
+        const expiredMarkets = markets
+          .filter(Boolean)
+          .filter((market: any) => market.endDate < now && market.status === 'active') as Market[];
+
+        // Process each expired market
+        for (const market of expiredMarkets) {
+          processed++;
+
+          try {
+            // Update the market to closed
+            await this.updateMarket(market.id, {
+              status: 'closed',
+              is_open: false
+            });
+
+            closed++;
+
+            // Close on-chain if enabled
+            if (autoCloseConfig.closeOnChain) {
+              const onChainResult = await this.closeMarketOnChain(market.id);
+
+              if (onChainResult?.txid) {
+                onChainSucceeded++;
+
+                marketLogger.info({
+                  marketId: market.id,
+                  txId: onChainResult.txid
+                }, 'Market closed on-chain successfully');
+              } else {
+                onChainFailed++;
+
+                marketLogger.warn({
+                  marketId: market.id
+                }, 'Failed to close market on-chain');
+              }
+            }
+
+            marketLogger.info({
+              marketId: market.id,
+              name: market.name,
+              endDate: market.endDate
+            }, 'Automatically closed expired market');
+          } catch (error) {
+            errors++;
+            marketLogger.error({
+              marketId: market.id,
+              error: error instanceof Error ? error.message : String(error)
+            }, 'Error closing expired market');
+          }
+        }
+      }
+
+      // Log summary
+      marketLogger.info({
+        processed,
+        closed,
+        errors,
+        onChainSucceeded,
+        onChainFailed
+      }, 'Completed auto-close of expired markets');
+
+      return {
+        success: true,
+        processed,
+        closed,
+        errors,
+        onChainSucceeded,
+        onChainFailed
+      };
+    } catch (error) {
+      marketLogger.error({
+        error: error instanceof Error ? error.message : String(error)
+      }, 'Failed to auto-close expired markets');
+
+      return { success: false, processed: 0, closed: 0, errors: 1 };
     }
   }
 };
