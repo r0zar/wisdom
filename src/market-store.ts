@@ -1,16 +1,34 @@
 import * as kvStore from './kv-store';
-import { 
-  generateUUID, 
-  MarketQueryOptions, 
-  filterMarkets, 
-  sortMarkets, 
-  paginateResults, 
+import {
+  generateUUID,
+  MarketQueryOptions,
+  filterMarkets,
+  sortMarkets,
+  paginateResults,
   PaginatedResult
 } from './utils';
 import { AppError, logger } from './logger';
+import {
+  makeContractCall,
+  broadcastTransaction,
+  stringAsciiCV,
+  listCV,
+  PostConditionMode,
+  TxBroadcastResult
+} from "@stacks/transactions";
+import { STACKS_MAINNET } from '@stacks/network';
 
 // Create a logger instance for this module
 const marketLogger = logger.child({ context: 'market-store' });
+
+// On-chain market creation configuration
+const onChainConfig = {
+  enabled: process.env.ENABLE_ONCHAIN_MARKETS === 'true',
+  privateKey: process.env.MARKET_CREATOR_PRIVATE_KEY || '',
+  network: STACKS_MAINNET,
+  contractAddress: process.env.PREDICTION_CONTRACT_ADDRESS || 'SP2ZNGJ85ENDY6QRHQ5P2D4FXKGZWCKTB2T0Z55KS',
+  contractName: process.env.PREDICTION_CONTRACT_NAME || 'blaze-welsh-predictions-v1',
+};
 
 export interface Market {
   id: string;
@@ -33,7 +51,7 @@ export const marketStore = {
   // Get all markets
   async getMarkets(options?: MarketQueryOptions): Promise<PaginatedResult<Market>> {
     let marketIds: string[] = [];
-    
+
     // Use indexes when possible for more efficient retrieval
     if (options?.category) {
       // Get markets by category
@@ -45,7 +63,7 @@ export const marketStore = {
       // Get all market IDs
       marketIds = await kvStore.getSetMembers('MARKET_IDS', '');
     }
-    
+
     // If no markets found, return empty result
     if (marketIds.length === 0) {
       return {
@@ -58,7 +76,7 @@ export const marketStore = {
     // Get markets in parallel - limit the number if options are provided to avoid loading everything
     const limit = options?.limit || 100;
     const offset = options?.offset || (options?.cursor ? parseInt(options.cursor, 10) : 0);
-    
+
     // Apply sorting before fetching if we know the sort field is createdAt
     // This allows us to fetch only what we need
     let idsToFetch = marketIds;
@@ -67,7 +85,7 @@ export const marketStore = {
       // For now, just take the slice we need based on offset/limit
       idsToFetch = marketIds.slice(offset, offset + limit * 2); // Fetch extra items for filtering
     }
-    
+
     // Get markets in parallel
     const markets = await Promise.all(
       idsToFetch.map(id => this.getMarket(id))
@@ -85,7 +103,7 @@ export const marketStore = {
 
     // Apply filtering, sorting, and pagination
     let filteredMarkets = validMarkets;
-    
+
     // Apply filtering if options are provided
     if (options) {
       // Skip category and status filtering if we already used indexes
@@ -94,16 +112,16 @@ export const marketStore = {
         category: options.category && idsToFetch === marketIds ? options.category : undefined,
         status: options.status && idsToFetch === marketIds ? options.status : undefined
       };
-      
+
       filteredMarkets = filterMarkets(validMarkets, filterOpts);
-      
+
       // Apply sorting
       const sortedMarkets = sortMarkets(
-        filteredMarkets, 
-        options.sortBy || 'createdAt', 
+        filteredMarkets,
+        options.sortBy || 'createdAt',
         options.sortDirection || 'desc'
       );
-      
+
       // Apply pagination
       return paginateResults(sortedMarkets, {
         limit: options.limit,
@@ -137,6 +155,75 @@ export const marketStore = {
           data: { marketId: id }
         }).log();
       }
+    }
+  },
+
+  /**
+   * Helper function to create a market on-chain
+   * @param marketId Unique ID for the market
+   * @param name Name of the market
+   * @param description Description of the market
+   * @param outcomes List of outcome names
+   * @returns Promise resolving to the broadcast transaction result
+   */
+  async createMarketOnChain(
+    marketId: string,
+    name: string,
+    description: string,
+    outcomes: { id: number; name: string; }[]
+  ): Promise<TxBroadcastResult | null> {
+    try {
+      // Skip if on-chain creation is disabled
+      if (!onChainConfig.enabled) {
+        marketLogger.info({ marketId }, 'On-chain market creation is disabled');
+        return null;
+      }
+
+      // Validate private key is available
+      if (!onChainConfig.privateKey) {
+        throw new Error('Private key is required for on-chain market creation');
+      }
+
+      // Extract just the outcome names for the contract call
+      const outcomeNames = outcomes.map(outcome => outcome.name);
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: onChainConfig.contractAddress,
+        contractName: onChainConfig.contractName,
+        functionName: 'create-market',
+        functionArgs: [
+          stringAsciiCV(marketId),
+          stringAsciiCV(name.substring(0, 64)), // Limit to 64 chars for Clarity string-ascii 64
+          stringAsciiCV(description.substring(0, 128)), // Limit to 128 chars for Clarity string-ascii 128
+          listCV(outcomeNames.map(name => stringAsciiCV(name.substring(0, 32)))) // Limit each name to 32 chars
+        ],
+        senderKey: onChainConfig.privateKey,
+        validateWithAbi: true,
+        network: onChainConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000, // Set appropriate fee
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      marketLogger.info({
+        marketId,
+        txId: result.txid || 'unknown',
+        successful: !!result.txid
+      }, 'On-chain market creation transaction broadcast');
+
+      return result;
+    } catch (error) {
+      marketLogger.error({
+        marketId,
+        error: error instanceof Error ? error.message : String(error)
+      }, 'Failed to create market on-chain');
+
+      // We don't throw here - just log the error and return null
+      // This is to prevent the entire market creation from failing if on-chain creation fails
+      return null;
     }
   },
 
@@ -199,12 +286,12 @@ export const marketStore = {
       if (data.createdBy) {
         await tx.addToSetInTransaction('USER_MARKETS', data.createdBy, id);
       }
-      
+
       // Add to category index
       if (data.category) {
         await tx.addToSetInTransaction('MARKET_CATEGORY', data.category, id);
       }
-      
+
       // Add to status index
       await tx.addToSetInTransaction('MARKET_STATUS', 'active', id);
 
@@ -219,6 +306,24 @@ export const marketStore = {
           data: { marketId: id }
         }).log();
       }
+
+      // Create the market on-chain asynchronously
+      // We don't await this call to prevent blocking the main flow
+      this.createMarketOnChain(id, data.name, data.description, data.outcomes)
+        .then(result => {
+          if (result?.txid) {
+            marketLogger.info({
+              marketId: id,
+              txId: result.txid
+            }, 'Market created on-chain successfully');
+          }
+        })
+        .catch(error => {
+          marketLogger.error({
+            marketId: id,
+            error: error instanceof Error ? error.message : String(error)
+          }, 'Error in on-chain market creation');
+        });
 
       marketLogger.info({ marketId: id }, `Created new market: ${market.name}`);
       return market;
@@ -235,6 +340,68 @@ export const marketStore = {
           data: { marketName: data.name }
         }).log();
       }
+    }
+  },
+
+  /**
+   * Resolve a market on-chain with the winning outcome
+   * @param marketId Unique ID for the market
+   * @param winningOutcomeId The ID of the winning outcome
+   * @returns Promise resolving to the broadcast transaction result
+   */
+  async resolveMarketOnChain(
+    marketId: string,
+    winningOutcomeId: number
+  ): Promise<TxBroadcastResult | null> {
+    try {
+      // Skip if on-chain market interaction is disabled
+      if (!onChainConfig.enabled) {
+        marketLogger.info({ marketId }, 'On-chain market resolution is disabled');
+        return null;
+      }
+
+      // Validate private key is available
+      if (!onChainConfig.privateKey) {
+        throw new Error('Private key is required for on-chain market resolution');
+      }
+
+      // Import the needed CV constructor only when needed
+      const { uintCV } = await import('@stacks/transactions');
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: onChainConfig.contractAddress,
+        contractName: onChainConfig.contractName,
+        functionName: 'resolve-market',
+        functionArgs: [
+          stringAsciiCV(marketId),
+          uintCV(winningOutcomeId)
+        ],
+        senderKey: onChainConfig.privateKey,
+        validateWithAbi: true,
+        network: onChainConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000, // Set appropriate fee
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      marketLogger.info({
+        marketId,
+        txId: result.txid || 'unknown',
+        successful: !!result?.txid
+      }, 'On-chain market resolution transaction broadcast');
+
+      return result;
+    } catch (error) {
+      marketLogger.error({
+        marketId,
+        error: error instanceof Error ? error.message : String(error)
+      }, 'Failed to resolve market on-chain');
+
+      // We don't throw here - just log the error and return null
+      return null;
     }
   },
 
@@ -258,33 +425,56 @@ export const marketStore = {
       }
 
       const updatedMarket = { ...market, ...safeData };
-      
+
       // Start a transaction for atomic update
       const tx = await kvStore.startTransaction();
-      
+
       // Store the updated market
       await tx.addEntity('MARKET', id, updatedMarket);
-      
+
       // Update category index if category changed
       if (marketData.category && marketData.category !== market.category) {
         // Remove from old category
         await kvStore.removeFromSet('MARKET_CATEGORY', market.category, id);
-        
+
         // Add to new category
         await tx.addToSetInTransaction('MARKET_CATEGORY', marketData.category, id);
       }
-      
+
       // Update status index if status changed
       if (marketData.status && marketData.status !== market.status) {
         // Remove from old status
         await kvStore.removeFromSet('MARKET_STATUS', market.status, id);
-        
+
         // Add to new status
         await tx.addToSetInTransaction('MARKET_STATUS', marketData.status, id);
       }
-      
+
       // Execute transaction
       await tx.execute();
+
+      // Check if this is a market resolution update (is_resolved changed to true)
+      if (marketData.is_resolved === true && marketData.winning_outcome !== undefined &&
+        (!market.is_resolved || market.is_resolved === false)) {
+
+        // Asynchronously resolve the market on-chain
+        this.resolveMarketOnChain(id, marketData.winning_outcome)
+          .then(result => {
+            if (result?.txid) {
+              marketLogger.info({
+                marketId: id,
+                txId: result.txid,
+                winningOutcome: marketData.winning_outcome
+              }, 'Market resolved on-chain successfully');
+            }
+          })
+          .catch(error => {
+            marketLogger.error({
+              marketId: id,
+              error: error instanceof Error ? error.message : String(error)
+            }, 'Error in on-chain market resolution');
+          });
+      }
 
       marketLogger.debug(
         { marketId: id },
@@ -316,26 +506,26 @@ export const marketStore = {
       if (!market) {
         return false;
       }
-      
+
       // Start a transaction for atomic deletion
       await kvStore.startTransaction();
-      
+
       // Delete the market
       await kvStore.deleteEntity('MARKET', id);
 
       // Remove the market ID from the set of all market IDs
       await kvStore.removeFromSet('MARKET_IDS', '', id);
-      
+
       // Remove from category index
       if (market.category) {
         await kvStore.removeFromSet('MARKET_CATEGORY', market.category, id);
       }
-      
+
       // Remove from status index
       if (market.status) {
         await kvStore.removeFromSet('MARKET_STATUS', market.status, id);
       }
-      
+
       // Remove from creator's markets
       if (market.createdBy) {
         await kvStore.removeFromSet('USER_MARKETS', market.createdBy, id);
@@ -387,7 +577,7 @@ export const marketStore = {
         status: 'active',
         limit: 50 // Get enough markets to find good related ones
       });
-      
+
       const allMarkets = result.items;
 
       // Filter out the current market
@@ -412,7 +602,7 @@ export const marketStore = {
       return [];
     }
   },
-  
+
   // Get markets by category
   async getMarketsByCategory(category: string, options?: Omit<MarketQueryOptions, 'category'>): Promise<PaginatedResult<Market>> {
     return this.getMarkets({
@@ -420,7 +610,7 @@ export const marketStore = {
       category
     });
   },
-  
+
   // Search markets by text
   async searchMarkets(searchText: string, options?: Omit<MarketQueryOptions, 'search'>): Promise<PaginatedResult<Market>> {
     return this.getMarkets({
@@ -428,7 +618,7 @@ export const marketStore = {
       search: searchText
     });
   },
-  
+
   // Get trending markets (highest participation or pool amount)
   async getTrendingMarkets(limit: number = 10): Promise<Market[]> {
     const result = await this.getMarkets({
@@ -437,7 +627,7 @@ export const marketStore = {
       sortDirection: 'desc',
       limit
     });
-    
+
     return result.items;
   },
 
@@ -457,43 +647,43 @@ export const marketStore = {
     const union = new Set(Array.from(words1).concat(Array.from(words2)));
     return intersection.size / union.size;
   },
-  
+
   // Migration: Build indexes for existing markets
   async buildMarketIndexes(): Promise<{ success: boolean; indexed: number }> {
     try {
       // Get all market IDs
       const marketIds = await kvStore.getSetMembers('MARKET_IDS', '');
-      
+
       // Get all markets
       const markets = await Promise.all(
         marketIds.map(id => this.getMarket(id))
       );
-      
+
       // Filter out any undefined markets
       const validMarkets = markets.filter(Boolean) as Market[];
-      
+
       let indexedCount = 0;
-      
+
       // Process each market
       for (const market of validMarkets) {
         // Add to category index
         if (market.category) {
           await kvStore.addToSet('MARKET_CATEGORY', market.category, market.id);
         }
-        
+
         // Add to status index
         if (market.status) {
           await kvStore.addToSet('MARKET_STATUS', market.status, market.id);
         }
-        
+
         indexedCount++;
       }
-      
+
       marketLogger.info(
         { total: marketIds.length, indexed: indexedCount },
         'Market indexes built successfully'
       );
-      
+
       return { success: true, indexed: indexedCount };
     } catch (error) {
       marketLogger.error(

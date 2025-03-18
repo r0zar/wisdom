@@ -95,6 +95,7 @@ if (result.hasMore && result.nextCursor) {
 - Data access layer with Vercel KV store integration
 - Support for prediction markets, user balances, and stats
 - Advanced market search and filtering capabilities
+- On-chain market creation and resolution via Stacks blockchain
 - Pagination, sorting, and efficient data retrieval
 - Built for both ESM and CommonJS environments
 - Structured logging and error handling
