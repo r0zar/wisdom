@@ -27,7 +27,6 @@ export const KV_PREFIXES = {
   PREDICTION_NFT: 'prediction_nft',
   USER_BALANCE: 'user_balance',
   USER_STATS: 'user_stats',
-  ALL_USERS: 'all_users', // Index of all users for global lookups
   LEADERBOARD: 'leaderboard',
   LEADERBOARD_EARNINGS: 'leaderboard_earnings',
   LEADERBOARD_ACCURACY: 'leaderboard_accuracy',
@@ -37,7 +36,7 @@ export const KV_PREFIXES = {
   // Transaction custody-related prefixes
   CUSTODY_TRANSACTION: 'custody_transaction',
   CUSTODY_TRANSACTION_IDS: 'custody_transaction_ids',
-  USER_TRANSACTIONS: 'user_transactions', 
+  USER_TRANSACTIONS: 'user_transactions',
   SIGNER_TRANSACTIONS: 'signer_transactions',
   MARKET_TRANSACTIONS: 'market_transactions',
   CUSTODY_NFT_RECEIPT: 'custody_nft_receipt'
@@ -121,7 +120,7 @@ export async function getEntity<T>(entityType: EntityType, id: string): Promise<
     if (error instanceof AppError) {
       throw error;
     }
-    
+
     throw new AppError({
       message: `Failed to retrieve ${entityType} with ID ${id}`,
       context: 'kv-store',
@@ -155,7 +154,7 @@ export async function deleteEntity(entityType: EntityType, id: string): Promise<
       originalError: error instanceof Error ? error : new Error(String(error)),
       data: { entityType, id, operation: 'delete' }
     }).log();
-    
+
     return false;
   }
 }
@@ -182,7 +181,7 @@ export async function addToSet(setType: EntityType, id: string, memberId: string
       originalError: error instanceof Error ? error : new Error(String(error)),
       data: { setType, id, memberId, operation: 'sadd' }
     }).log();
-    
+
     return false;
   }
 }
@@ -209,7 +208,7 @@ export async function removeFromSet(setType: EntityType, id: string, memberId: s
       originalError: error instanceof Error ? error : new Error(String(error)),
       data: { setType, id, memberId, operation: 'srem' }
     }).log();
-    
+
     return false;
   }
 }
@@ -243,7 +242,7 @@ export async function getSetMembers(setType: EntityType, id: string): Promise<st
       originalError: error instanceof Error ? error : new Error(String(error)),
       data: { setType, id, operation: 'smembers' }
     }).log();
-    
+
     return [];
   }
 }
@@ -297,12 +296,12 @@ export async function getScoresFromSortedSet(setType: EntityType, memberIds: str
   try {
     const key = getKey(setType);
     const result: Record<string, number> = {};
-        
+
     // Process members in batches if there are many
     const batchSize = 50;
     for (let i = 0; i < memberIds.length; i += batchSize) {
       const batch = memberIds.slice(i, i + batchSize);
-            
+
       // Get scores for this batch
       const batchScores = await Promise.all(
         batch.map(async (memberId) => {
@@ -310,7 +309,7 @@ export async function getScoresFromSortedSet(setType: EntityType, memberIds: str
           return { memberId, score: score ? Number(score) : null };
         })
       );
-            
+
       // Add scores to result map
       batchScores.forEach(({ memberId, score }) => {
         if (score !== null) {
@@ -318,7 +317,7 @@ export async function getScoresFromSortedSet(setType: EntityType, memberIds: str
         }
       });
     }
-        
+
     return result;
   } catch (error) {
     console.error(`Error getting scores from sorted set ${setType}:`, error);
@@ -376,7 +375,7 @@ export async function getDebugInfo(): Promise<Record<string, unknown>> {
     };
 
     const keysByPattern = result.keysByPattern as Record<string, { count: number; sample: string[] }>;
-    
+
     for (const pattern of patterns) {
       const keys = await kv.keys(pattern);
       keysByPattern[pattern] = {
@@ -416,7 +415,7 @@ export async function startTransaction(): Promise<KvTransaction> {
   try {
     // @vercel/kv supports Redis transactions via the multi() method
     const transaction = kv.multi();
-    
+
     // Track operations for potential rollback planning
     const operations: Array<{
       type: 'entity' | 'set' | 'sortedSet';
@@ -424,44 +423,44 @@ export async function startTransaction(): Promise<KvTransaction> {
       id: string;
       data?: unknown;
     }> = [];
-    
+
     const txObject: KvTransaction = {
       operations,
-      
+
       // Add entity to transaction
       async addEntity<T>(entityType: EntityType, id: string, data: T): Promise<void> {
         const key = getKey(entityType, id);
         transaction.set(key, JSON.stringify(data));
         operations.push({ type: 'entity', entityType, id, data });
       },
-      
+
       // Add to set in transaction
       async addToSetInTransaction(setType: EntityType, id: string, memberId: string): Promise<void> {
         const key = getKey(setType, id);
         transaction.sadd(key, memberId);
         operations.push({ type: 'set', entityType: setType, id: memberId });
-        
+
         // Handle backward compatibility if needed
         if (setType === 'MARKET_IDS') {
           transaction.sadd('market_ids', memberId);
         }
       },
-      
+
       // Add to sorted set in transaction
       async addToSortedSetInTransaction(setType: EntityType, memberId: string, score: number): Promise<void> {
         const key = getKey(setType);
         transaction.zadd(key, { score, member: memberId });
         operations.push({ type: 'sortedSet', entityType: setType, id: memberId, data: score });
       },
-      
+
       // Execute all queued commands atomically
       async execute(): Promise<boolean> {
         try {
           kvLogger.debug(
-            { operationCount: operations.length }, 
+            { operationCount: operations.length },
             `Executing transaction with ${operations.length} operations`
           );
-          
+
           await transaction.exec();
           return true;
         } catch (error) {
@@ -472,17 +471,17 @@ export async function startTransaction(): Promise<KvTransaction> {
             originalError: error instanceof Error ? error : new Error(String(error)),
             data: { operationCount: operations.length }
           });
-          
+
           appError.log();
-          
+
           // Note: Redis transactions are atomic - they either all succeed or all fail
           // No manual rollback is needed as failed transactions don't apply any changes
-          
+
           return false;
         }
       }
     };
-    
+
     return txObject;
   } catch (error) {
     throw new AppError({

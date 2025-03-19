@@ -16,6 +16,7 @@ import {
   TxBroadcastResult
 } from "@stacks/transactions";
 import { STACKS_MAINNET } from '@stacks/network';
+import { bufferFromHex } from '@stacks/transactions/dist/cl';
 
 // Create a logger instance for this module
 const custodyLogger = logger.child({ context: 'custody-store' });
@@ -354,51 +355,45 @@ export const custodyStore = {
   },
 
   // Get a specific transaction by ID
-  async getTransaction(id: string): Promise<CustodyTransaction | undefined> {
-    try {
-      if (!id) return undefined;
-
-      const transaction = await kvStore.getEntity('CUSTODY_TRANSACTION', id);
-      return transaction as CustodyTransaction || undefined;
-    } catch (error) {
-      custodyLogger.error({ transactionId: id, error }, 'Error getting custody transaction');
-      return undefined;
-    }
+  async getTransaction(id: string): Promise<CustodyTransaction> {
+    const transaction = await kvStore.getEntity('CUSTODY_TRANSACTION', id);
+    return transaction as CustodyTransaction;
   },
 
   // Find a transaction by signature
-  async findBySignature(signature: string): Promise<CustodyTransaction[]> {
+  async findBySignature(signature: string): Promise<(CustodyTransaction)[]> {
     try {
       if (!signature) return [];
 
-      // Get all users since we don't have a signature index
-      const allUsers = await kvStore.getSetMembers('ALL_USERS', '');
+      // Get all markets to find all transactions
+      const marketsResult = await marketStore.getMarkets();
+      const markets = marketsResult.items;
 
-      if (allUsers.length === 0) {
+      if (markets.length === 0) {
+        custodyLogger.debug({ signature }, 'No markets found to check for transactions');
         return [];
       }
 
-      // Get transactions for all users
-      const userTransactionIds = await Promise.all(
-        allUsers.map(userId => kvStore.getSetMembers('USER_TRANSACTIONS', userId))
+      // Get transactions for all markets
+      const marketTransactionIdsPromises = markets.map(market =>
+        this.getMarketTransactions(market.id).then(transactions =>
+          transactions.filter((tx: any) => tx.signature === signature)
+        )
       );
 
-      // Flatten the array of arrays
-      const transactionIds = userTransactionIds.flat();
+      // Wait for all promises to resolve
+      const marketTransactions = await Promise.all(marketTransactionIdsPromises);
 
-      if (transactionIds.length === 0) {
-        return [];
-      }
+      // Flatten the array of arrays and filter for the specific signature
+      const matchingTransactions = marketTransactions.flat();
 
-      // Get all transactions in parallel
-      const transactions = await Promise.all(
-        transactionIds.map(id => this.getTransaction(id))
-      );
+      custodyLogger.debug({
+        signature,
+        marketsCount: markets.length,
+        matchingTransactionsCount: matchingTransactions.length
+      }, 'Finished searching for transactions by signature');
 
-      // Filter for the specific signature
-      return transactions
-        .filter(Boolean)
-        .filter(tx => tx && tx.signature === signature) as CustodyTransaction[];
+      return matchingTransactions;
     } catch (error) {
       custodyLogger.error({ signature, error }, 'Error finding transaction by signature');
       return [];
@@ -468,48 +463,45 @@ export const custodyStore = {
   // Get all pending predictions across all markets
   async getAllPendingPredictions(): Promise<CustodyTransaction[]> {
     try {
-      // Get all users
-      const allUsers = await kvStore.getSetMembers('ALL_USERS', '');
+      // Get all markets
+      const marketsResult = await marketStore.getMarkets();
+      const markets = marketsResult.items;
 
-      custodyLogger.debug({ userCount: allUsers.length }, 'Getting pending predictions - found users');
+      custodyLogger.info({ marketCount: markets.length }, 'Getting pending predictions - found markets');
 
-      if (allUsers.length === 0) {
+      if (markets.length === 0) {
         return [];
       }
 
-      // Get transactions for each user
-      const userTransactionIds = await Promise.all(
-        allUsers.map(userId => kvStore.getSetMembers('USER_TRANSACTIONS', userId))
-      );
+      // Get transactions for each market
+      const allMarketTransactionsPromises = markets.map(market => this.getMarketTransactions(market.id));
+      const allMarketTransactions = await Promise.all(allMarketTransactionsPromises);
 
       // Flatten the array of arrays
-      const transactionIds = userTransactionIds.flat();
+      const allTransactions = allMarketTransactions.flat();
 
-      custodyLogger.debug({ transactionCount: transactionIds.length }, 'Getting pending predictions - found transactions');
+      custodyLogger.info({
+        transactionCount: allTransactions.length,
+        marketCount: markets.length
+      }, 'Getting pending predictions - found transactions');
 
-      if (transactionIds.length === 0) {
+      if (allTransactions.length === 0) {
         return [];
       }
 
-      // Get all transactions in parallel
-      const transactions = await Promise.all(
-        transactionIds.map(id => this.getTransaction(id))
-      );
-
       // Filter for pending predictions only
-      const pendingPredictions = transactions
-        .filter(Boolean)
-        .filter(tx => tx && tx.status === 'pending' && tx.type === TransactionType.PREDICT) as CustodyTransaction[];
+      const pendingPredictions = allTransactions
+        .filter(tx => tx?.status === 'pending' && tx.type === TransactionType.PREDICT);
 
       // Log the results along with timestamps
       if (pendingPredictions.length > 0) {
-        custodyLogger.debug({
+        custodyLogger.info({
           pendingCount: pendingPredictions.length,
-          timestamps: pendingPredictions.map(tx => tx.takenCustodyAt),
+          timestamps: pendingPredictions.map(tx => tx?.takenCustodyAt),
           now: new Date().toISOString()
         }, 'Found pending predictions with timestamps');
       } else {
-        custodyLogger.debug({}, 'No pending predictions found');
+        custodyLogger.info({}, 'No pending predictions found');
       }
 
       return pendingPredictions;
@@ -827,6 +819,7 @@ export const custodyStore = {
    */
   async batchProcessPredictions(options?: {
     forceProcess?: boolean; // If true, process all pending transactions regardless of age
+    marketId?: string;
   }): Promise<{
     success: boolean;
     processed: number;
@@ -862,16 +855,20 @@ export const custodyStore = {
       );
 
       // Find all pending PREDICT transactions
-      const pendingPredictions = await this.getAllPendingPredictions();
-
+      let pendingPredictions
+      if (options?.marketId) {
+        pendingPredictions = await this.getPendingPredictionsForMarket(options.marketId);
+      } else {
+        pendingPredictions = await this.getAllPendingPredictions()
+      }
       // Log details about pending predictions before filtering
       if (pendingPredictions.length > 0) {
-        custodyLogger.debug({
+        custodyLogger.info({
           allPendingPredictions: pendingPredictions.map(tx => ({
-            id: tx.id,
-            takenCustodyAt: tx.takenCustodyAt,
-            status: tx.status,
-            marketId: tx.marketId
+            id: tx?.id,
+            takenCustodyAt: tx?.takenCustodyAt,
+            status: tx?.status,
+            marketId: tx?.marketId
           })),
           cutoffTimeISO,
           forceProcess: options?.forceProcess
@@ -938,16 +935,13 @@ export const custodyStore = {
 
       // Transform transactions to the format expected by the smart contract
       const operations = transactionsToProcess.map(tx => {
-        // Convert hex signature to buffer and extract market info
-        const sigBuffer = Buffer.from(tx.signature, 'hex');
-
         return tupleCV({
           signet: tupleCV({
-            signature: bufferCV(sigBuffer),
+            signature: bufferFromHex(tx.signature),
             nonce: uintCV(tx.nonce)
           }),
-          market_id: stringAsciiCV(tx.marketId?.toString() || ''),
-          outcome_id: uintCV(tx.outcomeId || 0),
+          "market-id": stringAsciiCV(tx.marketId?.toString() || ''),
+          "outcome-id": uintCV(tx.outcomeId || 0),
           amount: uintCV(tx.amount || 0)
         });
       });
