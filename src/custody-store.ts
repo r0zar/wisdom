@@ -422,9 +422,13 @@ export const custodyStore = {
   async getPendingPredictionsForMarket(marketId: string): Promise<CustodyTransaction[]> {
     try {
       if (!marketId) return [];
+      
+      custodyLogger.debug({ marketId }, 'Getting pending predictions for market');
 
       // Get all transaction IDs for the market
       const transactionIds = await kvStore.getSetMembers('MARKET_TRANSACTIONS', marketId.toString());
+      
+      custodyLogger.debug({ marketId, transactionCount: transactionIds.length }, 'Found market transactions');
 
       if (transactionIds.length === 0) {
         return [];
@@ -434,11 +438,27 @@ export const custodyStore = {
       const transactions = await Promise.all(
         transactionIds.map(id => this.getTransaction(id))
       );
+      
+      const validTransactions = transactions.filter(Boolean);
+      custodyLogger.debug({ 
+        marketId, 
+        validTransactionCount: validTransactions.length,
+        statuses: validTransactions.map(tx => tx?.status),
+        types: validTransactions.map(tx => tx?.type)
+      }, 'Received valid transactions');
 
       // Filter for pending predictions only
-      return transactions
+      const pendingPredictions = transactions
         .filter(Boolean)
         .filter(tx => tx && tx.status === 'pending' && tx.type === TransactionType.PREDICT) as CustodyTransaction[];
+      
+      custodyLogger.debug({ 
+        marketId, 
+        pendingCount: pendingPredictions.length,
+        pendingIds: pendingPredictions.map(tx => tx.id)
+      }, 'Found pending predictions for market');
+      
+      return pendingPredictions;
     } catch (error) {
       custodyLogger.error({ marketId, error }, 'Error getting pending predictions for market');
       return [];
@@ -450,32 +470,49 @@ export const custodyStore = {
     try {
       // Get all users
       const allUsers = await kvStore.getSetMembers('ALL_USERS', '');
-
+      
+      custodyLogger.debug({ userCount: allUsers.length }, 'Getting pending predictions - found users');
+      
       if (allUsers.length === 0) {
         return [];
       }
-
+      
       // Get transactions for each user
       const userTransactionIds = await Promise.all(
         allUsers.map(userId => kvStore.getSetMembers('USER_TRANSACTIONS', userId))
       );
-
+      
       // Flatten the array of arrays
       const transactionIds = userTransactionIds.flat();
-
+      
+      custodyLogger.debug({ transactionCount: transactionIds.length }, 'Getting pending predictions - found transactions');
+      
       if (transactionIds.length === 0) {
         return [];
       }
-
+      
       // Get all transactions in parallel
       const transactions = await Promise.all(
         transactionIds.map(id => this.getTransaction(id))
       );
-
+      
       // Filter for pending predictions only
-      return transactions
+      const pendingPredictions = transactions
         .filter(Boolean)
         .filter(tx => tx && tx.status === 'pending' && tx.type === TransactionType.PREDICT) as CustodyTransaction[];
+      
+      // Log the results along with timestamps
+      if (pendingPredictions.length > 0) {
+        custodyLogger.debug({ 
+          pendingCount: pendingPredictions.length,
+          timestamps: pendingPredictions.map(tx => tx.takenCustodyAt),
+          now: new Date().toISOString()
+        }, 'Found pending predictions with timestamps');
+      } else {
+        custodyLogger.debug({}, 'No pending predictions found');
+      }
+      
+      return pendingPredictions;
     } catch (error) {
       custodyLogger.error({ error }, 'Error getting all pending predictions');
       return [];
@@ -784,10 +821,13 @@ export const custodyStore = {
    * Process pending prediction transactions in batches to send them on-chain
    * This function is intended to be called by a cron job every hour
    * It will process up to maxBatchSize predictions at a time, FIFO order
-   * Only processes transactions that are at least minAgeMinutes old
+   * Only processes transactions that are at least minAgeMinutes old by default
+   * @param options Optional parameters to customize batch processing
    * @returns Results of the batch processing operation
    */
-  async batchProcessPredictions(): Promise<{
+  async batchProcessPredictions(options?: {
+    forceProcess?: boolean; // If true, process all pending transactions regardless of age
+  }): Promise<{
     success: boolean;
     processed: number;
     batched: number;
@@ -824,11 +864,50 @@ export const custodyStore = {
       // Find all pending PREDICT transactions
       const pendingPredictions = await this.getAllPendingPredictions();
 
+      // Log details about pending predictions before filtering
+      if (pendingPredictions.length > 0) {
+        custodyLogger.debug({
+          allPendingPredictions: pendingPredictions.map(tx => ({
+            id: tx.id,
+            takenCustodyAt: tx.takenCustodyAt,
+            status: tx.status,
+            marketId: tx.marketId
+          })),
+          cutoffTimeISO,
+          forceProcess: options?.forceProcess
+        }, 'Pending predictions before age filtering');
+      }
+      
+      // Decide if we should apply age filtering
+      const shouldApplyAgeFilter = !options?.forceProcess;
+      
+      if (options?.forceProcess) {
+        custodyLogger.info({ forceProcess: true }, 'Forcing processing of all pending predictions regardless of age');
+      }
+      
       // Filter and sort transactions:
-      // 1. Only include transactions older than the cutoff time
+      // 1. Only include transactions older than the cutoff time (unless forceProcess is true)
       // 2. Sort by oldest first (FIFO)
       const eligiblePredictions = pendingPredictions
-        .filter(tx => tx.takenCustodyAt < cutoffTimeISO)
+        .filter(tx => {
+          // Skip age check if forceProcess is true
+          if (!shouldApplyAgeFilter) {
+            return true;
+          }
+          
+          const isPastCutoff = tx.takenCustodyAt < cutoffTimeISO;
+          
+          if (!isPastCutoff) {
+            custodyLogger.debug({
+              transactionId: tx.id,
+              takenCustodyAt: tx.takenCustodyAt,
+              cutoffTimeISO,
+              comparison: `${tx.takenCustodyAt} < ${cutoffTimeISO} = ${isPastCutoff}`
+            }, 'Transaction not eligible due to age');
+          }
+          
+          return isPastCutoff;
+        })
         .sort((a, b) => (a.takenCustodyAt > b.takenCustodyAt ? 1 : -1));
 
       const eligibleCount = eligiblePredictions.length;
