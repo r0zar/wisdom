@@ -4,9 +4,33 @@ import { AppError, logger } from './logger';
 import { marketStore } from './market-store';
 import { userBalanceStore } from './user-balance-store';
 import { userStatsStore } from './user-stats-store';
+import {
+  makeContractCall,
+  broadcastTransaction,
+  listCV,
+  tupleCV,
+  bufferCV,
+  uintCV,
+  stringAsciiCV,
+  PostConditionMode,
+  TxBroadcastResult
+} from "@stacks/transactions";
+import { STACKS_MAINNET } from '@stacks/network';
 
 // Create a logger instance for this module
 const custodyLogger = logger.child({ context: 'custody-store' });
+
+// On-chain batch processing configuration
+const batchConfig = {
+  enabled: process.env.ENABLE_BATCH_PROCESSING === 'true',
+  maxBatchSize: Number(process.env.BATCH_MAX_SIZE || '200'),
+  minAgeMinutes: Number(process.env.BATCH_MIN_AGE_MINUTES || '15'),
+  // We'll use the same contract config as marketStore for consistency
+  privateKey: process.env.MARKET_CREATOR_PRIVATE_KEY || '',
+  network: STACKS_MAINNET,
+  contractAddress: process.env.PREDICTION_CONTRACT_ADDRESS || 'SP2ZNGJ85ENDY6QRHQ5P2D4FXKGZWCKTB2T0Z55KS',
+  contractName: process.env.PREDICTION_CONTRACT_NAME || 'blaze-welsh-predictions-v1',
+};
 
 // Define transaction types based on the chrome extension types
 export enum TransactionType {
@@ -88,9 +112,7 @@ export const custodyStore = {
       }
 
       // Check if this transaction is already in custody
-      const existingTx = await this.findByCriteria({
-        signature: data.signature
-      });
+      const existingTx = await this.findByCriteria({ signature: data.signature });
 
       if (existingTx.length > 0) {
         throw new AppError({
@@ -104,14 +126,11 @@ export const custodyStore = {
         }).log();
       }
 
-      custodyLogger.debug(
-        {
-          signature: data.signature.substring(0, 8) + '...',
-          userId: data.userId,
-          type: data.type
-        },
-        'Taking custody of transaction'
-      );
+      custodyLogger.debug({
+        signature: data.signature.substring(0, 8) + '...',
+        userId: data.userId,
+        type: data.type
+      }, 'Taking custody of transaction');
 
       // Use the transaction signature and nonce as a unique ID
       // This ensures we don't have duplicate custody records
@@ -542,6 +561,371 @@ export const custodyStore = {
 
     // Convert SVG to a data URI
     return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  },
+
+  /**
+   * Check if a prediction can be returned by the user
+   * This checks if the prediction is still within the return window and hasn't been submitted on-chain
+   * 
+   * @param transactionId The ID of the transaction to check
+   * @returns A boolean indicating if the prediction can be returned
+   */
+  async canReturnPrediction(transactionId: string): Promise<{
+    canReturn: boolean;
+    reason?: string;
+    transaction?: CustodyTransaction
+  }> {
+    try {
+      // Get the transaction
+      const transaction = await this.getTransaction(transactionId);
+      if (!transaction) {
+        return {
+          canReturn: false,
+          reason: 'Transaction not found'
+        };
+      }
+
+      // Check if the transaction is a prediction
+      if (transaction.type !== TransactionType.PREDICT) {
+        return {
+          canReturn: false,
+          reason: 'Transaction is not a prediction'
+        };
+      }
+
+      // Check if transaction status is pending (not already submitted/confirmed)
+      if (transaction.status !== 'pending') {
+        return {
+          canReturn: false,
+          reason: `Transaction status is ${transaction.status}, only pending transactions can be returned`
+        };
+      }
+
+      // Check if the transaction is within the return window
+      const now = new Date();
+      const custodyDate = new Date(transaction.takenCustodyAt);
+      const ageInMinutes = (now.getTime() - custodyDate.getTime()) / (1000 * 60);
+
+      if (ageInMinutes > batchConfig.minAgeMinutes) {
+        return {
+          canReturn: false,
+          reason: `Transaction is ${Math.floor(ageInMinutes)} minutes old, exceeding the ${batchConfig.minAgeMinutes} minute return window`
+        };
+      }
+
+      // Check if prediction has already been registered on chain by calling the contract
+      try {
+        const [contractAddress, contractName] = [
+          batchConfig.contractAddress,
+          batchConfig.contractName
+        ];
+
+        // Import the needed functions for contract call
+        const { fetchCallReadOnlyFunction, ClarityType } = await import('@stacks/transactions');
+
+        // Use receipt ID if available, otherwise try to use nonce as the receipt ID
+        const receiptId = transaction.receiptId || transaction.nonce;
+
+        // Call the get-owner function to check if the receipt exists on chain
+        const result = await fetchCallReadOnlyFunction({
+          contractAddress,
+          contractName,
+          functionName: 'get-owner',
+          functionArgs: [uintCV(receiptId)],
+          network: batchConfig.network,
+          senderAddress: transaction.signer
+        });
+
+        // If we get a successful response with an owner, it means the prediction exists on chain
+        if (result.type === ClarityType.ResponseOk && result.value && result.value.type !== ClarityType.OptionalNone) {
+          return {
+            canReturn: false,
+            reason: 'Prediction already exists on the blockchain'
+          };
+        }
+      } catch (error) {
+        // If there's an error calling the contract, log it but assume the prediction is not on chain
+        custodyLogger.warn(
+          {
+            transactionId,
+            error: error instanceof Error ? error.message : String(error)
+          },
+          'Error checking on-chain prediction status, continuing with assumption that it is not on chain'
+        );
+      }
+
+      // All checks passed, prediction can be returned
+      return {
+        canReturn: true,
+        transaction
+      };
+    } catch (error) {
+      custodyLogger.error(
+        {
+          transactionId,
+          error: error instanceof Error ? error.message : String(error)
+        },
+        'Error checking if prediction can be returned'
+      );
+
+      return {
+        canReturn: false,
+        reason: 'Error checking prediction status'
+      };
+    }
+  },
+
+  /**
+   * Return a prediction receipt to the user
+   * This will delete all records for the prediction
+   * 
+   * @param userId User ID requesting the return
+   * @param transactionId The ID of the transaction to return
+   * @returns Result of the return operation
+   */
+  async returnPrediction(userId: string, transactionId: string): Promise<{
+    success: boolean;
+    error?: string;
+    transaction?: CustodyTransaction;
+  }> {
+    try {
+      // Set up structured logging for this operation
+      const opLogger = custodyLogger.child({
+        operation: 'returnPrediction',
+        userId,
+        transactionId
+      });
+
+      opLogger.info({}, 'Starting prediction return process');
+
+      // Check if the prediction can be returned
+      const { canReturn, reason, transaction } = await this.canReturnPrediction(transactionId);
+
+      if (!canReturn || !transaction) {
+        opLogger.warn({ reason }, 'Prediction cannot be returned');
+        return { success: false, error: reason };
+      }
+
+      // Verify userId matches transaction userId (only owner can return)
+      if (transaction.userId !== userId) {
+        const error = 'Unauthorized: Only the user who made the prediction can return it';
+        opLogger.warn({ transactionUserId: transaction.userId }, error);
+        return { success: false, error };
+      }
+
+      // Delete the transaction and its associated data
+      opLogger.debug({}, 'Deleting transaction records');
+      const deleteResult = await this.deleteTransaction(transactionId);
+
+      if (!deleteResult) {
+        const error = 'Failed to delete transaction records';
+        opLogger.error({}, error);
+        return { success: false, error };
+      }
+
+      opLogger.info({}, 'Prediction successfully returned');
+
+      return {
+        success: true,
+        transaction
+      };
+    } catch (error) {
+      // If it's already an AppError, just log and return it
+      if (error instanceof AppError) {
+        error.log();
+        return { success: false, error: error.message };
+      }
+
+      // Handle other errors
+      const appError = new AppError({
+        message: 'Failed to return prediction',
+        context: 'custody-store',
+        code: 'PREDICTION_RETURN_ERROR',
+        originalError: error instanceof Error ? error : new Error(String(error)),
+        data: { userId, transactionId }
+      }).log();
+
+      return { success: false, error: appError.message };
+    }
+  },
+
+  /**
+   * Process pending prediction transactions in batches to send them on-chain
+   * This function is intended to be called by a cron job every hour
+   * It will process up to maxBatchSize predictions at a time, FIFO order
+   * Only processes transactions that are at least minAgeMinutes old
+   * @returns Results of the batch processing operation
+   */
+  async batchProcessPredictions(): Promise<{
+    success: boolean;
+    processed: number;
+    batched: number;
+    errors: number;
+    error?: string;
+    txid?: string;
+  }> {
+    try {
+      // Skip if batch processing is disabled
+      if (!batchConfig.enabled) {
+        custodyLogger.info({}, 'Batch prediction processing is disabled');
+        return { success: true, processed: 0, batched: 0, errors: 0 };
+      }
+
+      // Validate private key is available
+      if (!batchConfig.privateKey) {
+        throw new AppError({
+          message: 'Private key is required for batch processing',
+          context: 'custody-store',
+          code: 'BATCH_CONFIG_ERROR'
+        }).log();
+      }
+
+      // Calculate the cutoff time for processing (only process txs older than this)
+      const now = new Date();
+      const cutoffTime = new Date(now.getTime() - (batchConfig.minAgeMinutes * 60 * 1000));
+      const cutoffTimeISO = cutoffTime.toISOString();
+
+      custodyLogger.info(
+        { minAgeMinutes: batchConfig.minAgeMinutes, cutoffTime: cutoffTimeISO },
+        'Starting batch prediction processing'
+      );
+
+      // Find all pending PREDICT transactions
+      const pendingPredictions = await this.findByCriteria({
+        type: TransactionType.PREDICT,
+        status: 'pending'
+      });
+
+      // Filter and sort transactions:
+      // 1. Only include transactions older than the cutoff time
+      // 2. Sort by oldest first (FIFO)
+      const eligiblePredictions = pendingPredictions
+        .filter(tx => tx.takenCustodyAt < cutoffTimeISO)
+        .sort((a, b) => (a.takenCustodyAt > b.takenCustodyAt ? 1 : -1));
+
+      const eligibleCount = eligiblePredictions.length;
+      const totalCount = pendingPredictions.length;
+
+      custodyLogger.info(
+        {
+          totalPending: totalCount,
+          eligibleForProcessing: eligibleCount,
+          maxBatchSize: batchConfig.maxBatchSize
+        },
+        'Found pending prediction transactions'
+      );
+
+      // If no eligible transactions, return early
+      if (eligibleCount === 0) {
+        return { success: true, processed: 0, batched: 0, errors: 0 };
+      }
+
+      // Take only up to maxBatchSize transactions
+      const transactionsToProcess = eligiblePredictions.slice(0, batchConfig.maxBatchSize);
+      const batchSize = transactionsToProcess.length;
+
+      custodyLogger.info(
+        { batchSize, oldestTxTime: transactionsToProcess[0]?.takenCustodyAt },
+        'Processing batch of prediction transactions'
+      );
+
+      // Transform transactions to the format expected by the smart contract
+      const operations = transactionsToProcess.map(tx => {
+        // Convert hex signature to buffer and extract market info
+        const sigBuffer = Buffer.from(tx.signature, 'hex');
+
+        return tupleCV({
+          signet: tupleCV({
+            signature: bufferCV(sigBuffer),
+            nonce: uintCV(tx.nonce)
+          }),
+          market_id: stringAsciiCV(tx.marketId?.toString() || ''),
+          outcome_id: uintCV(tx.outcomeId || 0),
+          amount: uintCV(tx.amount || 0)
+        });
+      });
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: batchConfig.contractAddress,
+        contractName: batchConfig.contractName,
+        functionName: 'batch-predict',
+        functionArgs: [
+          listCV(operations)
+        ],
+        senderKey: batchConfig.privateKey,
+        validateWithAbi: true,
+        network: batchConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        // Set fee proportional to batch size
+        fee: Math.max(1000, 100 * batchSize)
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast batch prediction transaction',
+          context: 'custody-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'Unknown broadcast error' }
+        }).log();
+      }
+
+      custodyLogger.info(
+        { txid: result.txid, batchSize },
+        'Successfully submitted batch prediction transaction'
+      );
+
+      // Update the status of all processed transactions
+      let updatedCount = 0;
+      for (const tx of transactionsToProcess) {
+        try {
+          await this.updateTransactionStatus(tx.id, 'submitted');
+          updatedCount++;
+        } catch (updateError) {
+          custodyLogger.error(
+            { txId: tx.id, error: updateError },
+            'Failed to update transaction status to submitted'
+          );
+        }
+      }
+
+      return {
+        success: true,
+        processed: eligibleCount,
+        batched: batchSize,
+        errors: batchSize - updatedCount,
+        txid: result.txid
+      };
+    } catch (error) {
+      // Log and return the error
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      custodyLogger.error(
+        { error: errorMessage },
+        'Error in batch processing predictions'
+      );
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          processed: 0,
+          batched: 0,
+          errors: 1,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        processed: 0,
+        batched: 0,
+        errors: 1,
+        error: `Failed to process batch predictions: ${errorMessage}`
+      };
+    }
   },
 
   // Create a prediction with custody
