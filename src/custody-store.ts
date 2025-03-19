@@ -112,7 +112,7 @@ export const custodyStore = {
       }
 
       // Check if this transaction is already in custody
-      const existingTx = await this.findByCriteria({ signature: data.signature });
+      const existingTx = await this.findBySignature(data.signature);
 
       if (existingTx.length > 0) {
         throw new AppError({
@@ -365,6 +365,45 @@ export const custodyStore = {
       return undefined;
     }
   },
+  
+  // Find a transaction by signature
+  async findBySignature(signature: string): Promise<CustodyTransaction[]> {
+    try {
+      if (!signature) return [];
+      
+      // Get all users since we don't have a signature index
+      const allUsers = await kvStore.getSetMembers('ALL_USERS', '');
+      
+      if (allUsers.length === 0) {
+        return [];
+      }
+      
+      // Get transactions for all users
+      const userTransactionIds = await Promise.all(
+        allUsers.map(userId => kvStore.getSetMembers('USER_TRANSACTIONS', userId))
+      );
+      
+      // Flatten the array of arrays
+      const transactionIds = userTransactionIds.flat();
+      
+      if (transactionIds.length === 0) {
+        return [];
+      }
+      
+      // Get all transactions in parallel
+      const transactions = await Promise.all(
+        transactionIds.map(id => this.getTransaction(id))
+      );
+      
+      // Filter for the specific signature
+      return transactions
+        .filter(Boolean)
+        .filter(tx => tx && tx.signature === signature) as CustodyTransaction[];
+    } catch (error) {
+      custodyLogger.error({ signature, error }, 'Error finding transaction by signature');
+      return [];
+    }
+  },
 
   // Get a specific NFT receipt
   async getNFTReceipt(id: string) {
@@ -379,46 +418,13 @@ export const custodyStore = {
     }
   },
 
-  // Find transactions matching criteria
-  async findByCriteria(criteria: {
-    signature?: string;
-    nonce?: number;
-    signer?: string;
-    type?: TransactionType;
-    status?: string;
-    userId?: string;
-    marketId?: string | number;
-    [key: string]: any; // Allow other properties
-  }): Promise<CustodyTransaction[]> {
+  // Get pending predictions for a specific market
+  async getPendingPredictionsForMarket(marketId: string): Promise<CustodyTransaction[]> {
     try {
-      let transactionIds: string[] = [];
+      if (!marketId) return [];
 
-      // Try to use the most efficient index based on criteria
-      if (criteria.userId) {
-        // If looking for a specific user's transactions
-        transactionIds = await kvStore.getSetMembers('USER_TRANSACTIONS', criteria.userId);
-      } else if (criteria.signer) {
-        // If looking for a specific signer's transactions
-        transactionIds = await kvStore.getSetMembers('SIGNER_TRANSACTIONS', criteria.signer);
-      } else if (criteria.marketId) {
-        // If looking for a market's transactions
-        transactionIds = await kvStore.getSetMembers('MARKET_TRANSACTIONS', criteria.marketId.toString());
-      } else {
-        // No efficient lookup available, so we need to scan all transactions
-        // This could be very inefficient with large datasets
-        // In a production environment, we'd want additional indices or a query engine
-
-        // For demo purposes, let's just look at all users and build a composite set
-        const allUsers = await kvStore.getSetMembers('ALL_USERS', '');
-
-        // Get transactions for each user
-        const userTransactionIds = await Promise.all(
-          allUsers.map(userId => kvStore.getSetMembers('USER_TRANSACTIONS', userId))
-        );
-
-        // Flatten the array of arrays
-        transactionIds = userTransactionIds.flat();
-      }
+      // Get all transaction IDs for the market
+      const transactionIds = await kvStore.getSetMembers('MARKET_TRANSACTIONS', marketId.toString());
 
       if (transactionIds.length === 0) {
         return [];
@@ -429,49 +435,49 @@ export const custodyStore = {
         transactionIds.map(id => this.getTransaction(id))
       );
 
-      // Filter out undefined transactions and apply criteria filter in a more lenient way
+      // Filter for pending predictions only
       return transactions
         .filter(Boolean)
-        .filter(tx => {
-          if (!tx) return false;
-
-          // Check each criteria property with type-flexible comparison
-          for (const [key, value] of Object.entries(criteria)) {
-            // Skip if the transaction doesn't have this property
-            if (tx[key as keyof CustodyTransaction] === undefined) continue;
-
-            // For marketId, do string comparison to handle number/string mismatches
-            if (key === 'marketId') {
-              if (String(tx[key]) !== String(value)) {
-                return false;
-              }
-            }
-            // For numeric values, try to compare as numbers
-            else if (typeof value === 'number' || !isNaN(Number(value))) {
-              const numericTxValue = Number(tx[key as keyof CustodyTransaction]);
-              const numericCriteriaValue = Number(value);
-
-              // Only do numeric comparison if both values can be converted to valid numbers
-              if (!isNaN(numericTxValue) && !isNaN(numericCriteriaValue)) {
-                if (numericTxValue !== numericCriteriaValue) {
-                  return false;
-                }
-              }
-              // Otherwise fall back to strict equality
-              else if (tx[key as keyof CustodyTransaction] !== value) {
-                return false;
-              }
-            }
-            // For other property types, use strict equality
-            else if (tx[key as keyof CustodyTransaction] !== value) {
-              return false;
-            }
-          }
-
-          return true;
-        }) as CustodyTransaction[];
+        .filter(tx => tx && tx.status === 'pending' && tx.type === TransactionType.PREDICT) as CustodyTransaction[];
     } catch (error) {
-      custodyLogger.error({ criteria, error }, 'Error finding custody transactions by criteria');
+      custodyLogger.error({ marketId, error }, 'Error getting pending predictions for market');
+      return [];
+    }
+  },
+
+  // Get all pending predictions across all markets
+  async getAllPendingPredictions(): Promise<CustodyTransaction[]> {
+    try {
+      // Get all users
+      const allUsers = await kvStore.getSetMembers('ALL_USERS', '');
+
+      if (allUsers.length === 0) {
+        return [];
+      }
+
+      // Get transactions for each user
+      const userTransactionIds = await Promise.all(
+        allUsers.map(userId => kvStore.getSetMembers('USER_TRANSACTIONS', userId))
+      );
+
+      // Flatten the array of arrays
+      const transactionIds = userTransactionIds.flat();
+
+      if (transactionIds.length === 0) {
+        return [];
+      }
+
+      // Get all transactions in parallel
+      const transactions = await Promise.all(
+        transactionIds.map(id => this.getTransaction(id))
+      );
+
+      // Filter for pending predictions only
+      return transactions
+        .filter(Boolean)
+        .filter(tx => tx && tx.status === 'pending' && tx.type === TransactionType.PREDICT) as CustodyTransaction[];
+    } catch (error) {
+      custodyLogger.error({ error }, 'Error getting all pending predictions');
       return [];
     }
   },
@@ -816,10 +822,7 @@ export const custodyStore = {
       );
 
       // Find all pending PREDICT transactions
-      const pendingPredictions = await this.findByCriteria({
-        type: TransactionType.PREDICT,
-        status: 'pending'
-      });
+      const pendingPredictions = await this.getAllPendingPredictions();
 
       // Filter and sort transactions:
       // 1. Only include transactions older than the cutoff time
