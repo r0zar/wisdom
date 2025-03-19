@@ -429,16 +429,41 @@ export const custodyStore = {
         transactionIds.map(id => this.getTransaction(id))
       );
 
-      // Filter out undefined transactions and apply criteria filter
+      // Filter out undefined transactions and apply criteria filter in a more lenient way
       return transactions
         .filter(Boolean)
         .filter(tx => {
           if (!tx) return false;
 
-          // Check each criteria property
+          // Check each criteria property with type-flexible comparison
           for (const [key, value] of Object.entries(criteria)) {
-            //@ts-ignore
-            if (tx[key] !== value) {
+            // Skip if the transaction doesn't have this property
+            if (tx[key as keyof CustodyTransaction] === undefined) continue;
+
+            // For marketId, do string comparison to handle number/string mismatches
+            if (key === 'marketId') {
+              if (String(tx[key]) !== String(value)) {
+                return false;
+              }
+            }
+            // For numeric values, try to compare as numbers
+            else if (typeof value === 'number' || !isNaN(Number(value))) {
+              const numericTxValue = Number(tx[key as keyof CustodyTransaction]);
+              const numericCriteriaValue = Number(value);
+
+              // Only do numeric comparison if both values can be converted to valid numbers
+              if (!isNaN(numericTxValue) && !isNaN(numericCriteriaValue)) {
+                if (numericTxValue !== numericCriteriaValue) {
+                  return false;
+                }
+              }
+              // Otherwise fall back to strict equality
+              else if (tx[key as keyof CustodyTransaction] !== value) {
+                return false;
+              }
+            }
+            // For other property types, use strict equality
+            else if (tx[key as keyof CustodyTransaction] !== value) {
               return false;
             }
           }
