@@ -4,20 +4,12 @@ import { AppError, logger } from './logger';
 import { marketStore } from './market-store';
 import { userBalanceStore } from './user-balance-store';
 import { userStatsStore } from './user-stats-store';
-import { predictionContractStore } from './prediction-contract-store';
-import {
-  makeContractCall,
-  broadcastTransaction,
-  listCV,
-  tupleCV,
-  bufferCV,
-  uintCV,
-  stringAsciiCV,
-  PostConditionMode,
-  TxBroadcastResult
-} from "@stacks/transactions";
-import { STACKS_MAINNET } from '@stacks/network';
-import { bufferFromHex } from '@stacks/transactions/dist/cl';
+import { 
+  predictionContractStore, 
+  SignedTransactionParams,
+  BatchPredictionOperation,
+  BatchClaimOperation
+} from './prediction-contract-store';
 
 // Create a logger instance for this module
 const custodyLogger = logger.child({ context: 'custody-store' });
@@ -27,11 +19,6 @@ const batchConfig = {
   enabled: process.env.ENABLE_BATCH_PROCESSING === 'true',
   maxBatchSize: Number(process.env.BATCH_MAX_SIZE || '200'),
   minAgeMinutes: Number(process.env.BATCH_MIN_AGE_MINUTES || '15'),
-  // We'll use the same contract config as marketStore for consistency
-  privateKey: process.env.MARKET_CREATOR_PRIVATE_KEY || '',
-  network: STACKS_MAINNET,
-  contractAddress: process.env.PREDICTION_CONTRACT_ADDRESS || 'SP2ZNGJ85ENDY6QRHQ5P2D4FXKGZWCKTB2T0Z55KS',
-  contractName: process.env.PREDICTION_CONTRACT_NAME || 'blaze-welsh-predictions-v1',
 };
 
 // Define transaction types based on the chrome extension types
@@ -1291,15 +1278,6 @@ export const custodyStore = {
         return { success: true, processed: 0, batched: 0, errors: 0 };
       }
 
-      // Validate private key is available
-      if (!batchConfig.privateKey) {
-        throw new AppError({
-          message: 'Private key is required for batch processing',
-          context: 'custody-store',
-          code: 'BATCH_CONFIG_ERROR'
-        }).log();
-      }
-
       // Calculate the cutoff time for processing (only process txs older than this)
       const now = new Date();
       const cutoffTime = new Date(now.getTime() - (batchConfig.minAgeMinutes * 60 * 1000));
@@ -1317,6 +1295,7 @@ export const custodyStore = {
       } else {
         pendingPredictions = await this.getAllPendingPredictions()
       }
+      
       // Log details about pending predictions before filtering
       if (pendingPredictions.length > 0) {
         custodyLogger.info({
@@ -1389,44 +1368,26 @@ export const custodyStore = {
         'Processing batch of prediction transactions'
       );
 
-      // Transform transactions to the format expected by the smart contract
-      const operations = transactionsToProcess.map(tx => {
-        return tupleCV({
-          signet: tupleCV({
-            signature: bufferFromHex(tx.signature),
-            nonce: uintCV(tx.nonce)
-          }),
-          "market-id": stringAsciiCV(tx.marketId?.toString() || ''),
-          "outcome-id": uintCV(tx.outcomeId || 0),
-          amount: uintCV(tx.amount || 0)
-        });
-      });
+      // Transform transactions to the format expected by the batchPredict function
+      const operations: BatchPredictionOperation[] = transactionsToProcess.map(tx => ({
+        signet: {
+          signature: tx.signature,
+          nonce: tx.nonce
+        },
+        marketId: tx.marketId?.toString() || '',
+        outcomeId: tx.outcomeId || 0,
+        amount: tx.amount || 0
+      }));
 
-      // Prepare the contract call
-      const transaction = await makeContractCall({
-        contractAddress: batchConfig.contractAddress,
-        contractName: batchConfig.contractName,
-        functionName: 'batch-predict',
-        functionArgs: [
-          listCV(operations)
-        ],
-        senderKey: batchConfig.privateKey,
-        validateWithAbi: true,
-        network: batchConfig.network,
-        postConditionMode: PostConditionMode.Allow,
-        // Set fee proportional to batch size
-        fee: Math.max(1000, 100 * batchSize)
-      });
+      // Use the contract store to process the batch
+      const result = await predictionContractStore.batchPredict(operations);
 
-      // Broadcast the transaction
-      const result = await broadcastTransaction({ transaction });
-
-      if (!result.txid) {
+      if (!result.success || !result.txid) {
         throw new AppError({
-          message: 'Failed to broadcast batch prediction transaction',
+          message: result.error || 'Failed to process batch prediction transaction',
           context: 'custody-store',
-          code: 'BROADCAST_ERROR',
-          data: { error: 'Unknown broadcast error' }
+          code: 'BATCH_PREDICT_ERROR',
+          data: { error: result.error }
         }).log();
       }
 
@@ -1504,6 +1465,7 @@ export const custodyStore = {
     transaction?: CustodyTransaction;
     error?: string;
     market?: Record<string, unknown>;
+    txid?: string;
   }> {
     try {
       // Set up structured logging for this operation

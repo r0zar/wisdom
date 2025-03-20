@@ -1,9 +1,11 @@
 /**
  * Prediction Contract Store: Direct interface to the Clarity smart contract
  * 
- * This module provides read-only function wrappers for interacting with the
+ * This module provides function wrappers for interacting with the
  * prediction market contract. It abstracts the complexity of making direct
  * contract calls and provides a cleaner interface for the rest of the application.
+ * 
+ * Includes both read-only functions and functions for state-changing operations.
  */
 
 import { logger } from './logger';
@@ -13,10 +15,15 @@ import { STACKS_MAINNET } from '@stacks/network';
 // Import the types and functions we need for contract calls
 import {
   fetchCallReadOnlyFunction,
+  makeContractCall,
+  broadcastTransaction,
   uintCV,
   stringAsciiCV,
   tupleCV,
   listCV,
+  noneCV,
+  someCV,
+  bufferCV,
   ClarityType,
   ClarityValue,
   OptionalCV,
@@ -28,6 +35,9 @@ import {
   ListCV,
   TupleCV,
   cvToValue,
+  PostConditionMode,
+  TxBroadcastResult,
+  Cl
 } from '@stacks/transactions';
 
 // Contract configuration - consistent with other stores
@@ -35,6 +45,7 @@ const contractConfig = {
   contractAddress: process.env.PREDICTION_CONTRACT_ADDRESS || 'SP2ZNGJ85ENDY6QRHQ5P2D4FXKGZWCKTB2T0Z55KS',
   contractName: process.env.PREDICTION_CONTRACT_NAME || 'blaze-welsh-predictions-v1',
   network: STACKS_MAINNET,
+  privateKey: process.env.MARKET_CREATOR_PRIVATE_KEY || '',
 };
 
 // Create a logger instance for this module
@@ -78,7 +89,59 @@ export interface PredictionRewardQuote {
 }
 
 /**
- * Prediction contract store with read-only functions to query the contract
+ * Interface for market creation result
+ */
+export interface MarketCreationResult {
+  marketId: string;
+  creator: string;
+  creationTime: number;
+}
+
+/**
+ * Interface for market resolution request
+ */
+export interface MarketResolutionRequest {
+  marketId: string;
+  winningOutcomeId: number;
+}
+
+/**
+ * Interface for prediction transaction result
+ */
+export interface PredictionTransactionResult {
+  dx: string; // market id
+  dy: number; // pool amount
+  dk: number; // receipt id
+}
+
+/**
+ * Interface for signed transaction parameters
+ */
+export interface SignedTransactionParams {
+  signature: string; // hex string of signature buffer
+  nonce: number;
+}
+
+/**
+ * Interface for batch prediction operation
+ */
+export interface BatchPredictionOperation {
+  signet: SignedTransactionParams;
+  marketId: string;
+  outcomeId: number;
+  amount: number;
+}
+
+/**
+ * Interface for batch claim reward operation
+ */
+export interface BatchClaimOperation {
+  signet: SignedTransactionParams;
+  receiptId: number;
+}
+
+/**
+ * Prediction contract store with functions to query and interact with the contract
  */
 export const predictionContractStore = {
   /**
@@ -494,6 +557,1277 @@ export const predictionContractStore = {
         originalError: error instanceof Error ? error : new Error(String(error)),
         data: { pendingCount: pendingIds.length }
       }).log();
+    }
+  },
+
+  /**
+   * Create a new prediction market on the blockchain
+   * @param marketId Unique identifier for the market (max 64 ASCII chars)
+   * @param name Name of the market (max 64 ASCII chars)
+   * @param description Description of the market (max 128 ASCII chars)
+   * @param outcomeNames List of possible outcome names (max 16 outcomes, each max 32 chars)
+   * @param senderKey Private key of the sender (defaults to contract config)
+   * @returns Result of the transaction with market creation details
+   */
+  async createMarket(
+    marketId: string,
+    name: string,
+    description: string,
+    outcomeNames: string[],
+    senderKey?: string
+  ): Promise<{
+    success: boolean;
+    result?: MarketCreationResult;
+    txid?: string;
+    error?: string;
+  }> {
+    try {
+      contractLogger.info({
+        marketId,
+        name,
+        descriptionLength: description.length,
+        outcomeCount: outcomeNames.length
+      }, 'Creating new prediction market on-chain');
+
+      // Validate input
+      if (!marketId || !name || !description || !outcomeNames.length) {
+        throw new AppError({
+          message: 'Invalid market data',
+          context: 'prediction-contract-store',
+          code: 'INVALID_MARKET_DATA',
+          data: { marketId, name, descriptionLength: description.length, outcomeCount: outcomeNames.length }
+        }).log();
+      }
+
+      // Validate string lengths according to contract constraints
+      if (marketId.length > 64) {
+        throw new AppError({
+          message: 'Market ID exceeds maximum length of 64 ASCII characters',
+          context: 'prediction-contract-store',
+          code: 'INVALID_MARKET_ID_LENGTH',
+          data: { marketId, length: marketId.length }
+        }).log();
+      }
+
+      if (name.length > 64) {
+        throw new AppError({
+          message: 'Market name exceeds maximum length of 64 ASCII characters',
+          context: 'prediction-contract-store',
+          code: 'INVALID_MARKET_NAME_LENGTH',
+          data: { name, length: name.length }
+        }).log();
+      }
+
+      if (description.length > 128) {
+        throw new AppError({
+          message: 'Market description exceeds maximum length of 128 ASCII characters',
+          context: 'prediction-contract-store',
+          code: 'INVALID_MARKET_DESCRIPTION_LENGTH',
+          data: { descriptionLength: description.length }
+        }).log();
+      }
+
+      if (outcomeNames.length > 16) {
+        throw new AppError({
+          message: 'Too many outcomes, maximum is 16',
+          context: 'prediction-contract-store',
+          code: 'TOO_MANY_OUTCOMES',
+          data: { outcomeCount: outcomeNames.length }
+        }).log();
+      }
+
+      // Check if any outcome name is too long
+      const longOutcomes = outcomeNames.filter(name => name.length > 32);
+      if (longOutcomes.length > 0) {
+        throw new AppError({
+          message: 'One or more outcome names exceed maximum length of 32 ASCII characters',
+          context: 'prediction-contract-store',
+          code: 'INVALID_OUTCOME_NAME_LENGTH',
+          data: { longOutcomes: longOutcomes.map(name => ({ name, length: name.length })) }
+        }).log();
+      }
+
+      // Use provided senderKey or fall back to config
+      const key = senderKey || contractConfig.privateKey;
+      if (!key) {
+        throw new AppError({
+          message: 'No private key available for transaction',
+          context: 'prediction-contract-store',
+          code: 'NO_PRIVATE_KEY'
+        }).log();
+      }
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: contractConfig.contractAddress,
+        contractName: contractConfig.contractName,
+        functionName: 'create-market',
+        functionArgs: [
+          stringAsciiCV(marketId),
+          stringAsciiCV(name),
+          stringAsciiCV(description),
+          listCV(outcomeNames.map(name => stringAsciiCV(name)))
+        ],
+        senderKey: key,
+        validateWithAbi: true,
+        network: contractConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000 // Default fee, can be adjusted based on network conditions
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast market creation transaction',
+          context: 'prediction-contract-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'No transaction ID returned' }
+        }).log();
+      }
+
+      contractLogger.info({
+        txid: result.txid,
+        marketId,
+        name
+      }, 'Successfully submitted market creation transaction');
+
+      return {
+        success: true,
+        txid: result.txid,
+        result: {
+          marketId,
+          creator: transaction.auth.spendingCondition.signer,
+          creationTime: Math.floor(Date.now() / 1000)
+        }
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      contractLogger.error({
+        marketId,
+        error: errorMessage
+      }, 'Error creating market on blockchain');
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        error: `Failed to create market: ${errorMessage}`
+      };
+    }
+  },
+
+  /**
+   * Close a market (no more predictions allowed)
+   * @param marketId The ID of the market to close
+   * @param senderKey Private key of the sender (must be admin or deployer)
+   * @returns Result of the transaction
+   */
+  async closeMarket(
+    marketId: string,
+    senderKey?: string
+  ): Promise<{
+    success: boolean;
+    txid?: string;
+    error?: string;
+  }> {
+    try {
+      contractLogger.info({ marketId }, 'Closing market on-chain');
+
+      // Validate input
+      if (!marketId) {
+        throw new AppError({
+          message: 'Invalid market ID',
+          context: 'prediction-contract-store',
+          code: 'INVALID_MARKET_ID',
+          data: { marketId }
+        }).log();
+      }
+
+      // Use provided senderKey or fall back to config
+      const key = senderKey || contractConfig.privateKey;
+      if (!key) {
+        throw new AppError({
+          message: 'No private key available for transaction',
+          context: 'prediction-contract-store',
+          code: 'NO_PRIVATE_KEY'
+        }).log();
+      }
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: contractConfig.contractAddress,
+        contractName: contractConfig.contractName,
+        functionName: 'close-market',
+        functionArgs: [
+          stringAsciiCV(marketId)
+        ],
+        senderKey: key,
+        validateWithAbi: true,
+        network: contractConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast market close transaction',
+          context: 'prediction-contract-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'No transaction ID returned' }
+        }).log();
+      }
+
+      contractLogger.info({
+        txid: result.txid,
+        marketId
+      }, 'Successfully submitted market close transaction');
+
+      return {
+        success: true,
+        txid: result.txid
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      contractLogger.error({
+        marketId,
+        error: errorMessage
+      }, 'Error closing market on blockchain');
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        error: `Failed to close market: ${errorMessage}`
+      };
+    }
+  },
+
+  /**
+   * Resolve a market by setting the winning outcome
+   * @param marketId The ID of the market to resolve
+   * @param winningOutcomeId The ID of the winning outcome
+   * @param senderKey Private key of the sender (must be admin or deployer)
+   * @returns Result of the transaction
+   */
+  async resolveMarket(
+    marketId: string,
+    winningOutcomeId: number,
+    senderKey?: string
+  ): Promise<{
+    success: boolean;
+    txid?: string;
+    error?: string;
+  }> {
+    try {
+      contractLogger.info({ marketId, winningOutcomeId }, 'Resolving market on-chain');
+
+      // Validate input
+      if (!marketId) {
+        throw new AppError({
+          message: 'Invalid market ID',
+          context: 'prediction-contract-store',
+          code: 'INVALID_MARKET_ID',
+          data: { marketId }
+        }).log();
+      }
+
+      if (winningOutcomeId < 0) {
+        throw new AppError({
+          message: 'Invalid winning outcome ID',
+          context: 'prediction-contract-store',
+          code: 'INVALID_OUTCOME_ID',
+          data: { winningOutcomeId }
+        }).log();
+      }
+
+      // Use provided senderKey or fall back to config
+      const key = senderKey || contractConfig.privateKey;
+      if (!key) {
+        throw new AppError({
+          message: 'No private key available for transaction',
+          context: 'prediction-contract-store',
+          code: 'NO_PRIVATE_KEY'
+        }).log();
+      }
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: contractConfig.contractAddress,
+        contractName: contractConfig.contractName,
+        functionName: 'resolve-market',
+        functionArgs: [
+          stringAsciiCV(marketId),
+          uintCV(winningOutcomeId)
+        ],
+        senderKey: key,
+        validateWithAbi: true,
+        network: contractConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast market resolution transaction',
+          context: 'prediction-contract-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'No transaction ID returned' }
+        }).log();
+      }
+
+      contractLogger.info({
+        txid: result.txid,
+        marketId,
+        winningOutcomeId
+      }, 'Successfully submitted market resolution transaction');
+
+      return {
+        success: true,
+        txid: result.txid
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      contractLogger.error({
+        marketId,
+        winningOutcomeId,
+        error: errorMessage
+      }, 'Error resolving market on blockchain');
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        error: `Failed to resolve market: ${errorMessage}`
+      };
+    }
+  },
+
+  /**
+   * Make a prediction on a market outcome (direct transaction)
+   * @param marketId The ID of the market
+   * @param outcomeId The ID of the outcome being predicted
+   * @param amount The amount to stake on this prediction
+   * @param senderKey Private key of the sender
+   * @returns Result of the transaction with prediction details
+   */
+  async makePrediction(
+    marketId: string,
+    outcomeId: number,
+    amount: number,
+    senderKey: string
+  ): Promise<{
+    success: boolean;
+    result?: PredictionTransactionResult;
+    txid?: string;
+    error?: string;
+  }> {
+    try {
+      contractLogger.info({
+        marketId,
+        outcomeId,
+        amount
+      }, 'Making prediction on-chain');
+
+      // Validate input
+      if (!marketId || outcomeId < 0 || amount <= 0) {
+        throw new AppError({
+          message: 'Invalid prediction data',
+          context: 'prediction-contract-store',
+          code: 'INVALID_PREDICTION_DATA',
+          data: { marketId, outcomeId, amount }
+        }).log();
+      }
+
+      if (!senderKey) {
+        throw new AppError({
+          message: 'No private key provided for transaction',
+          context: 'prediction-contract-store',
+          code: 'NO_PRIVATE_KEY'
+        }).log();
+      }
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: contractConfig.contractAddress,
+        contractName: contractConfig.contractName,
+        functionName: 'make-prediction',
+        functionArgs: [
+          stringAsciiCV(marketId),
+          uintCV(outcomeId),
+          uintCV(amount)
+        ],
+        senderKey: senderKey,
+        validateWithAbi: true,
+        network: contractConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast prediction transaction',
+          context: 'prediction-contract-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'No transaction ID returned' }
+        }).log();
+      }
+
+      contractLogger.info({
+        txid: result.txid,
+        marketId,
+        outcomeId,
+        amount
+      }, 'Successfully submitted prediction transaction');
+
+      // We don't know the receipt ID yet - it will be assigned by the contract
+      // The receipt ID should be retrieved by monitoring the transaction result
+      return {
+        success: true,
+        txid: result.txid,
+        result: {
+          dx: marketId,
+          dy: amount,
+          dk: 0 // We don't know the actual receipt ID yet
+        }
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      contractLogger.error({
+        marketId,
+        outcomeId,
+        amount,
+        error: errorMessage
+      }, 'Error making prediction on blockchain');
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        error: `Failed to make prediction: ${errorMessage}`
+      };
+    }
+  },
+
+  /**
+   * Make a prediction using a signed transaction
+   * @param signet Signature and nonce for the transaction
+   * @param marketId The ID of the market
+   * @param outcomeId The ID of the outcome being predicted
+   * @param amount The amount to stake on this prediction
+   * @param senderKey Private key for sending the transaction (admin key)
+   * @returns Result of the transaction with prediction details
+   */
+  async signedPredict(
+    signet: SignedTransactionParams,
+    marketId: string,
+    outcomeId: number,
+    amount: number,
+    senderKey?: string
+  ): Promise<{
+    success: boolean;
+    result?: PredictionTransactionResult;
+    txid?: string;
+    error?: string;
+  }> {
+    try {
+      contractLogger.info({
+        marketId,
+        outcomeId,
+        amount,
+        nonce: signet.nonce
+      }, 'Making signed prediction on-chain');
+
+      // Validate input
+      if (!marketId || outcomeId < 0 || amount <= 0) {
+        throw new AppError({
+          message: 'Invalid prediction data',
+          context: 'prediction-contract-store',
+          code: 'INVALID_PREDICTION_DATA',
+          data: { marketId, outcomeId, amount }
+        }).log();
+      }
+
+      if (!signet.signature || signet.nonce === undefined) {
+        throw new AppError({
+          message: 'Invalid signet data',
+          context: 'prediction-contract-store',
+          code: 'INVALID_SIGNET',
+          data: { hasSignature: !!signet.signature, hasNonce: signet.nonce !== undefined }
+        }).log();
+      }
+
+      // Use provided senderKey or fall back to config
+      const key = senderKey || contractConfig.privateKey;
+      if (!key) {
+        throw new AppError({
+          message: 'No private key available for transaction',
+          context: 'prediction-contract-store',
+          code: 'NO_PRIVATE_KEY'
+        }).log();
+      }
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: contractConfig.contractAddress,
+        contractName: contractConfig.contractName,
+        functionName: 'signed-predict',
+        functionArgs: [
+          tupleCV({
+            signature: bufferCV(Buffer.from(signet.signature, 'hex')),
+            nonce: uintCV(signet.nonce)
+          }),
+          stringAsciiCV(marketId),
+          uintCV(outcomeId),
+          uintCV(amount)
+        ],
+        senderKey: key,
+        validateWithAbi: true,
+        network: contractConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast signed prediction transaction',
+          context: 'prediction-contract-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'No transaction ID returned' }
+        }).log();
+      }
+
+      contractLogger.info({
+        txid: result.txid,
+        marketId,
+        outcomeId,
+        amount,
+        nonce: signet.nonce
+      }, 'Successfully submitted signed prediction transaction');
+
+      // The receipt ID should be the same as the nonce in signed transactions
+      return {
+        success: true,
+        txid: result.txid,
+        result: {
+          dx: marketId,
+          dy: amount,
+          dk: signet.nonce
+        }
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      contractLogger.error({
+        marketId,
+        outcomeId,
+        amount,
+        nonce: signet.nonce,
+        error: errorMessage
+      }, 'Error making signed prediction on blockchain');
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        error: `Failed to make signed prediction: ${errorMessage}`
+      };
+    }
+  },
+
+  /**
+   * Claim a reward for a winning prediction
+   * @param receiptId The ID of the winning prediction receipt
+   * @param senderKey Private key of the receipt owner
+   * @returns Result of the transaction with reward details
+   */
+  async claimReward(
+    receiptId: number,
+    senderKey: string
+  ): Promise<{
+    success: boolean;
+    result?: PredictionTransactionResult;
+    txid?: string;
+    error?: string;
+  }> {
+    try {
+      contractLogger.info({ receiptId }, 'Claiming prediction reward on-chain');
+
+      // Validate input
+      if (receiptId <= 0) {
+        throw new AppError({
+          message: 'Invalid receipt ID',
+          context: 'prediction-contract-store',
+          code: 'INVALID_RECEIPT_ID',
+          data: { receiptId }
+        }).log();
+      }
+
+      if (!senderKey) {
+        throw new AppError({
+          message: 'No private key provided for transaction',
+          context: 'prediction-contract-store',
+          code: 'NO_PRIVATE_KEY'
+        }).log();
+      }
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: contractConfig.contractAddress,
+        contractName: contractConfig.contractName,
+        functionName: 'claim-reward',
+        functionArgs: [
+          uintCV(receiptId)
+        ],
+        senderKey: senderKey,
+        validateWithAbi: true,
+        network: contractConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast claim reward transaction',
+          context: 'prediction-contract-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'No transaction ID returned' }
+        }).log();
+      }
+
+      contractLogger.info({
+        txid: result.txid,
+        receiptId
+      }, 'Successfully submitted claim reward transaction');
+
+      return {
+        success: true,
+        txid: result.txid,
+        result: {
+          dx: "", // We don't know the market ID yet
+          dy: 0,  // We don't know the reward amount yet
+          dk: receiptId
+        }
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      contractLogger.error({
+        receiptId,
+        error: errorMessage
+      }, 'Error claiming reward on blockchain');
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        error: `Failed to claim reward: ${errorMessage}`
+      };
+    }
+  },
+
+  /**
+   * Claim a reward using a signed transaction
+   * @param signet Signature and nonce for the transaction
+   * @param receiptId The ID of the winning prediction receipt
+   * @param senderKey Private key for sending the transaction (admin key)
+   * @returns Result of the transaction with reward details
+   */
+  async signedClaimReward(
+    signet: SignedTransactionParams,
+    receiptId: number,
+    senderKey?: string
+  ): Promise<{
+    success: boolean;
+    result?: PredictionTransactionResult;
+    txid?: string;
+    error?: string;
+  }> {
+    try {
+      contractLogger.info({
+        receiptId,
+        nonce: signet.nonce
+      }, 'Claiming reward with signed transaction on-chain');
+
+      // Validate input
+      if (receiptId <= 0) {
+        throw new AppError({
+          message: 'Invalid receipt ID',
+          context: 'prediction-contract-store',
+          code: 'INVALID_RECEIPT_ID',
+          data: { receiptId }
+        }).log();
+      }
+
+      if (!signet.signature || signet.nonce === undefined) {
+        throw new AppError({
+          message: 'Invalid signet data',
+          context: 'prediction-contract-store',
+          code: 'INVALID_SIGNET',
+          data: { hasSignature: !!signet.signature, hasNonce: signet.nonce !== undefined }
+        }).log();
+      }
+
+      // Use provided senderKey or fall back to config
+      const key = senderKey || contractConfig.privateKey;
+      if (!key) {
+        throw new AppError({
+          message: 'No private key available for transaction',
+          context: 'prediction-contract-store',
+          code: 'NO_PRIVATE_KEY'
+        }).log();
+      }
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: contractConfig.contractAddress,
+        contractName: contractConfig.contractName,
+        functionName: 'signed-claim-reward',
+        functionArgs: [
+          tupleCV({
+            signature: bufferCV(Buffer.from(signet.signature, 'hex')),
+            nonce: uintCV(signet.nonce)
+          }),
+          uintCV(receiptId)
+        ],
+        senderKey: key,
+        validateWithAbi: true,
+        network: contractConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast signed claim reward transaction',
+          context: 'prediction-contract-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'No transaction ID returned' }
+        }).log();
+      }
+
+      contractLogger.info({
+        txid: result.txid,
+        receiptId,
+        nonce: signet.nonce
+      }, 'Successfully submitted signed claim reward transaction');
+
+      return {
+        success: true,
+        txid: result.txid,
+        result: {
+          dx: "", // We don't know the market ID yet
+          dy: 0,  // We don't know the reward amount yet
+          dk: receiptId
+        }
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      contractLogger.error({
+        receiptId,
+        nonce: signet.nonce,
+        error: errorMessage
+      }, 'Error claiming reward with signed transaction on blockchain');
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        error: `Failed to claim reward with signed transaction: ${errorMessage}`
+      };
+    }
+  },
+
+  /**
+   * Process a batch of prediction operations in a single transaction
+   * @param operations Array of prediction operations to execute
+   * @param senderKey Private key for sending the transaction (admin key)
+   * @returns Result of the batch operation
+   */
+  async batchPredict(
+    operations: BatchPredictionOperation[],
+    senderKey?: string
+  ): Promise<{
+    success: boolean;
+    results?: boolean[];
+    txid?: string;
+    error?: string;
+  }> {
+    try {
+      contractLogger.info({
+        operationCount: operations.length
+      }, 'Processing batch predictions on-chain');
+
+      // Validate input
+      if (!operations.length) {
+        throw new AppError({
+          message: 'No operations provided for batch processing',
+          context: 'prediction-contract-store',
+          code: 'EMPTY_BATCH',
+          data: { operationCount: 0 }
+        }).log();
+      }
+
+      // Check maximum batch size (from contract constant)
+      const MAX_BATCH_SIZE = 200; // From contract
+      if (operations.length > MAX_BATCH_SIZE) {
+        throw new AppError({
+          message: `Batch size exceeds maximum of ${MAX_BATCH_SIZE} operations`,
+          context: 'prediction-contract-store',
+          code: 'BATCH_TOO_LARGE',
+          data: { operationCount: operations.length, maxSize: MAX_BATCH_SIZE }
+        }).log();
+      }
+
+      // Use provided senderKey or fall back to config
+      const key = senderKey || contractConfig.privateKey;
+      if (!key) {
+        throw new AppError({
+          message: 'No private key available for transaction',
+          context: 'prediction-contract-store',
+          code: 'NO_PRIVATE_KEY'
+        }).log();
+      }
+
+      // Transform operations into contract format
+      const operationCVs = operations.map(op => {
+        return tupleCV({
+          signet: tupleCV({
+            signature: bufferCV(Buffer.from(op.signet.signature, 'hex')),
+            nonce: uintCV(op.signet.nonce)
+          }),
+          "market-id": stringAsciiCV(op.marketId),
+          "outcome-id": uintCV(op.outcomeId),
+          amount: uintCV(op.amount)
+        });
+      });
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: contractConfig.contractAddress,
+        contractName: contractConfig.contractName,
+        functionName: 'batch-predict',
+        functionArgs: [
+          listCV(operationCVs)
+        ],
+        senderKey: key,
+        validateWithAbi: true,
+        network: contractConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        // Set fee proportional to batch size
+        fee: Math.max(1000, 100 * operations.length)
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast batch predict transaction',
+          context: 'prediction-contract-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'No transaction ID returned' }
+        }).log();
+      }
+
+      contractLogger.info({
+        txid: result.txid,
+        operationCount: operations.length
+      }, 'Successfully submitted batch predict transaction');
+
+      return {
+        success: true,
+        txid: result.txid,
+        // We don't know the actual results until the transaction is processed
+        results: Array(operations.length).fill(true)
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      contractLogger.error({
+        operationCount: operations.length,
+        error: errorMessage
+      }, 'Error processing batch predictions on blockchain');
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        error: `Failed to process batch predictions: ${errorMessage}`
+      };
+    }
+  },
+
+  /**
+   * Process a batch of claim reward operations in a single transaction
+   * @param operations Array of claim reward operations to execute
+   * @param senderKey Private key for sending the transaction (admin key)
+   * @returns Result of the batch operation
+   */
+  async batchClaimReward(
+    operations: BatchClaimOperation[],
+    senderKey?: string
+  ): Promise<{
+    success: boolean;
+    results?: boolean[];
+    txid?: string;
+    error?: string;
+  }> {
+    try {
+      contractLogger.info({
+        operationCount: operations.length
+      }, 'Processing batch claim rewards on-chain');
+
+      // Validate input
+      if (!operations.length) {
+        throw new AppError({
+          message: 'No operations provided for batch processing',
+          context: 'prediction-contract-store',
+          code: 'EMPTY_BATCH',
+          data: { operationCount: 0 }
+        }).log();
+      }
+
+      // Check maximum batch size (from contract constant)
+      const MAX_BATCH_SIZE = 200; // From contract
+      if (operations.length > MAX_BATCH_SIZE) {
+        throw new AppError({
+          message: `Batch size exceeds maximum of ${MAX_BATCH_SIZE} operations`,
+          context: 'prediction-contract-store',
+          code: 'BATCH_TOO_LARGE',
+          data: { operationCount: operations.length, maxSize: MAX_BATCH_SIZE }
+        }).log();
+      }
+
+      // Use provided senderKey or fall back to config
+      const key = senderKey || contractConfig.privateKey;
+      if (!key) {
+        throw new AppError({
+          message: 'No private key available for transaction',
+          context: 'prediction-contract-store',
+          code: 'NO_PRIVATE_KEY'
+        }).log();
+      }
+
+      // Transform operations into contract format
+      const operationCVs = operations.map(op => {
+        return tupleCV({
+          signet: tupleCV({
+            signature: bufferCV(Buffer.from(op.signet.signature, 'hex')),
+            nonce: uintCV(op.signet.nonce)
+          }),
+          "receipt-id": uintCV(op.receiptId)
+        });
+      });
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: contractConfig.contractAddress,
+        contractName: contractConfig.contractName,
+        functionName: 'batch-claim-reward',
+        functionArgs: [
+          listCV(operationCVs)
+        ],
+        senderKey: key,
+        validateWithAbi: true,
+        network: contractConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        // Set fee proportional to batch size
+        fee: Math.max(1000, 100 * operations.length)
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast batch claim reward transaction',
+          context: 'prediction-contract-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'No transaction ID returned' }
+        }).log();
+      }
+
+      contractLogger.info({
+        txid: result.txid,
+        operationCount: operations.length
+      }, 'Successfully submitted batch claim reward transaction');
+
+      return {
+        success: true,
+        txid: result.txid,
+        // We don't know the actual results until the transaction is processed
+        results: Array(operations.length).fill(true)
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      contractLogger.error({
+        operationCount: operations.length,
+        error: errorMessage
+      }, 'Error processing batch claim rewards on blockchain');
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        error: `Failed to process batch claim rewards: ${errorMessage}`
+      };
+    }
+  },
+
+  /**
+   * Add an admin to the contract
+   * @param adminAddress The principal address to add as admin
+   * @param senderKey Private key of the contract deployer (required)
+   * @returns Result of the transaction
+   */
+  async addAdmin(
+    adminAddress: string,
+    senderKey?: string
+  ): Promise<{
+    success: boolean;
+    txid?: string;
+    error?: string;
+  }> {
+    try {
+      contractLogger.info({ adminAddress }, 'Adding admin on-chain');
+
+      // Validate input
+      if (!adminAddress) {
+        throw new AppError({
+          message: 'Invalid admin address',
+          context: 'prediction-contract-store',
+          code: 'INVALID_ADMIN_ADDRESS',
+          data: { adminAddress }
+        }).log();
+      }
+
+      // Use provided senderKey or fall back to config
+      const key = senderKey || contractConfig.privateKey;
+      if (!key) {
+        throw new AppError({
+          message: 'No private key available for transaction',
+          context: 'prediction-contract-store',
+          code: 'NO_PRIVATE_KEY'
+        }).log();
+      }
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: contractConfig.contractAddress,
+        contractName: contractConfig.contractName,
+        functionName: 'add-admin',
+        functionArgs: [Cl.principal(adminAddress)],
+        senderKey: key,
+        validateWithAbi: true,
+        network: contractConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast add admin transaction',
+          context: 'prediction-contract-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'No transaction ID returned' }
+        }).log();
+      }
+
+      contractLogger.info({
+        txid: result.txid,
+        adminAddress
+      }, 'Successfully submitted add admin transaction');
+
+      return {
+        success: true,
+        txid: result.txid
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      contractLogger.error({
+        adminAddress,
+        error: errorMessage
+      }, 'Error adding admin on blockchain');
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        error: `Failed to add admin: ${errorMessage}`
+      };
+    }
+  },
+
+  /**
+   * Remove an admin from the contract
+   * @param adminAddress The principal address to remove as admin
+   * @param senderKey Private key of the contract deployer (required)
+   * @returns Result of the transaction
+   */
+  async removeAdmin(
+    adminAddress: string,
+    senderKey?: string
+  ): Promise<{
+    success: boolean;
+    txid?: string;
+    error?: string;
+  }> {
+    try {
+      contractLogger.info({ adminAddress }, 'Removing admin on-chain');
+
+      // Validate input
+      if (!adminAddress) {
+        throw new AppError({
+          message: 'Invalid admin address',
+          context: 'prediction-contract-store',
+          code: 'INVALID_ADMIN_ADDRESS',
+          data: { adminAddress }
+        }).log();
+      }
+
+      // Use provided senderKey or fall back to config
+      const key = senderKey || contractConfig.privateKey;
+      if (!key) {
+        throw new AppError({
+          message: 'No private key available for transaction',
+          context: 'prediction-contract-store',
+          code: 'NO_PRIVATE_KEY'
+        }).log();
+      }
+
+      // Prepare the contract call
+      const transaction = await makeContractCall({
+        contractAddress: contractConfig.contractAddress,
+        contractName: contractConfig.contractName,
+        functionName: 'remove-admin',
+        functionArgs: [Cl.address(adminAddress)],
+        senderKey: key,
+        validateWithAbi: true,
+        network: contractConfig.network,
+        postConditionMode: PostConditionMode.Allow,
+        fee: 1000
+      });
+
+      // Broadcast the transaction
+      const result = await broadcastTransaction({ transaction });
+
+      if (!result.txid) {
+        throw new AppError({
+          message: 'Failed to broadcast remove admin transaction',
+          context: 'prediction-contract-store',
+          code: 'BROADCAST_ERROR',
+          data: { error: 'No transaction ID returned' }
+        }).log();
+      }
+
+      contractLogger.info({
+        txid: result.txid,
+        adminAddress
+      }, 'Successfully submitted remove admin transaction');
+
+      return {
+        success: true,
+        txid: result.txid
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      contractLogger.error({
+        adminAddress,
+        error: errorMessage
+      }, 'Error removing admin on blockchain');
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        error: `Failed to remove admin: ${errorMessage}`
+      };
     }
   }
 };
