@@ -4,6 +4,7 @@ import { AppError, logger } from './logger';
 import { marketStore } from './market-store';
 import { userBalanceStore } from './user-balance-store';
 import { userStatsStore } from './user-stats-store';
+import { predictionContractStore } from './prediction-contract-store';
 import {
   makeContractCall,
   broadcastTransaction,
@@ -40,6 +41,9 @@ export enum TransactionType {
   CLAIM_REWARD = 'claim-reward',
 }
 
+// User-facing status types
+export type UserFacingStatus = 'pending' | 'won' | 'lost' | 'redeemed';
+
 // Interface for a transaction in custody
 export interface CustodyTransaction {
   // Transaction core data (comes from signed transaction)
@@ -70,6 +74,12 @@ export interface CustodyTransaction {
   marketName?: string;
   outcomeName?: string;
   nftReceipt?: any;
+  potentialPayout?: number; // Potential payout amount for winners
+
+  // Blockchain verification metadata
+  blockchainStatus?: UserFacingStatus; // Status verified from blockchain
+  verifiedAt?: string; // When blockchain status was last verified
+  isVerifiedWinner?: boolean; // Flag for verified winners
 }
 
 // Custody store with Vercel KV
@@ -304,6 +314,111 @@ export const custodyStore = {
     }
   },
 
+  /**
+   * Get all potentially redeemable (won) predictions for a user with blockchain verification
+   * This is specifically for showing accurate "Ready to Redeem" predictions to users
+   */
+  async getUserRedeemablePredictions(userId: string): Promise<{
+    redeemablePredictions: CustodyTransaction[];
+    totalPotentialPayout: number;
+  }> {
+    try {
+      if (!userId) {
+        return { redeemablePredictions: [], totalPotentialPayout: 0 };
+      }
+
+      custodyLogger.debug({ userId }, 'Getting redeemable predictions for user');
+
+      // Get all user's transactions
+      const allTransactions = await this.getUserTransactions(userId);
+
+      // Filter for prediction transactions that are either 'won' or 'submitted'
+      // (submitted might be resolved on-chain but not updated in our system)
+      const potentiallyRedeemable = allTransactions.filter(tx =>
+        tx.type === TransactionType.PREDICT &&
+        (tx.blockchainStatus === 'won' || tx.status === 'submitted')
+      );
+
+      if (potentiallyRedeemable.length === 0) {
+        return { redeemablePredictions: [], totalPotentialPayout: 0 };
+      }
+
+      custodyLogger.debug({
+        userId,
+        potentialCount: potentiallyRedeemable.length
+      }, 'Found potentially redeemable predictions');
+
+      // Verify each prediction against the blockchain (batch of 5 at a time)
+      const verifiedRedeemable: CustodyTransaction[] = [];
+      let totalPayout = 0;
+
+      // Process in batches of 5
+      const batchSize = 5;
+      for (let i = 0; i < potentiallyRedeemable.length; i += batchSize) {
+        const batch = potentiallyRedeemable.slice(i, i + batchSize);
+
+        // Process each prediction in parallel
+        const verificationPromises = batch.map(async (tx) => {
+          try {
+            const receiptId = tx.receiptId || tx.nonce;
+
+            // Get the reward quote from the blockchain
+            const rewardQuote = await predictionContractStore.getRewardQuote(receiptId);
+
+            // If there's a reward > 0, this prediction is truly redeemable
+            if (rewardQuote && rewardQuote.dy > 0) {
+              // Update the potential payout with the exact on-chain amount
+              return {
+                ...tx,
+                potentialPayout: rewardQuote.dy,
+                isVerifiedWinner: true
+              };
+            }
+            return null;
+          } catch (error) {
+            custodyLogger.warn(
+              {
+                transactionId: tx.id,
+                error: error instanceof Error ? error.message : String(error)
+              },
+              'Error verifying prediction redeemability'
+            );
+            // In case of error, use our local data
+            return tx.blockchainStatus === 'won' ? tx : null;
+          }
+        });
+
+        const results = await Promise.all(verificationPromises);
+
+        // Add verified winners to our list
+        for (const result of results) {
+          if (result) {
+            verifiedRedeemable.push(result);
+            totalPayout += (result.potentialPayout || 0);
+          }
+        }
+      }
+
+      custodyLogger.info({
+        userId,
+        verifiedCount: verifiedRedeemable.length,
+        totalPayout
+      }, 'Verified redeemable predictions against blockchain');
+
+      return {
+        redeemablePredictions: verifiedRedeemable,
+        totalPotentialPayout: totalPayout
+      };
+    } catch (error) {
+      custodyLogger.error({
+        userId,
+        error: error instanceof Error ? error.message : String(error)
+      }, 'Error getting redeemable predictions');
+
+      return { redeemablePredictions: [], totalPotentialPayout: 0 };
+    }
+  },
+
   // Get all transactions in custody for a signer
   async getSignerTransactions(signer: string) {
     try {
@@ -354,10 +469,106 @@ export const custodyStore = {
     }
   },
 
-  // Get a specific transaction by ID
-  async getTransaction(id: string): Promise<CustodyTransaction> {
-    const transaction = await kvStore.getEntity('CUSTODY_TRANSACTION', id);
-    return transaction as CustodyTransaction;
+  /**
+   * Helper function to get the user-facing status for a transaction
+   * This combines the internal status with blockchain verification data
+   */
+  getUserFacingStatus(transaction: CustodyTransaction): UserFacingStatus {
+    // If we have verified blockchain status, use it
+    if (transaction.blockchainStatus) {
+      return transaction.blockchainStatus;
+    }
+
+    // Otherwise, derive from technical status
+    if (transaction.status === 'pending') {
+      return 'pending';
+    }
+
+    if (transaction.status === 'confirmed') {
+      return 'redeemed';
+    }
+
+    if (transaction.status === 'rejected') {
+      // Rejected predictions are similar to lost ones from user perspective
+      return 'lost';
+    }
+
+    // For 'submitted' status, we don't know if it's won/lost without blockchain
+    // Default to pending for safety
+    return 'pending';
+  },
+
+  /**
+   * Get a specific transaction by ID
+   * @param id The transaction ID
+   * @param options Optional parameters
+   * @param options.verifyBlockchain Whether to verify status against blockchain for submitted transactions
+   * @returns The transaction object
+   */
+  async getTransaction(
+    id: string,
+    options?: { verifyBlockchain?: boolean }
+  ): Promise<CustodyTransaction> {
+    try {
+      const transaction = await kvStore.getEntity('CUSTODY_TRANSACTION', id) as CustodyTransaction;
+
+      if (!transaction) {
+        return transaction;
+      }
+
+      // If blockchain verification is requested and this is a prediction
+      if (options?.verifyBlockchain &&
+        transaction.type === TransactionType.PREDICT &&
+        transaction.status === 'submitted') {
+
+        try {
+          const receiptId = transaction.receiptId || transaction.nonce;
+          const now = new Date().toISOString();
+
+          // Get the prediction status from the blockchain
+          const onChainStatus = await predictionContractStore.getPredictionStatus(receiptId);
+
+          // If we got a valid status from blockchain
+          if (onChainStatus) {
+            // Update the transaction with blockchain data
+            transaction.blockchainStatus = onChainStatus;
+            transaction.verifiedAt = now;
+
+            // If it's a winner, get the reward amount
+            if (onChainStatus === 'won') {
+              const reward = await predictionContractStore.getRewardQuote(receiptId);
+              if (reward) {
+                transaction.potentialPayout = reward.dy;
+                transaction.isVerifiedWinner = true;
+              }
+            }
+
+            // Store the updated transaction with blockchain data
+            await kvStore.storeEntity('CUSTODY_TRANSACTION', id, transaction);
+
+            custodyLogger.debug({
+              transactionId: id,
+              blockchainStatus: onChainStatus,
+              technicalStatus: transaction.status
+            }, 'Updated transaction with blockchain status');
+          }
+        } catch (error) {
+          custodyLogger.warn({
+            transactionId: id,
+            error: error instanceof Error ? error.message : String(error)
+          }, 'Failed to verify transaction against blockchain');
+          // Continue with unverified transaction
+        }
+      }
+
+      return transaction;
+    } catch (error) {
+      custodyLogger.error({
+        transactionId: id,
+        error: error instanceof Error ? error.message : String(error)
+      }, 'Error getting transaction');
+      return null as unknown as CustodyTransaction;
+    }
   },
 
   // Find a transaction by signature
@@ -521,6 +732,48 @@ export const custodyStore = {
       const transaction = await this.getTransaction(id);
       if (!transaction) return undefined;
 
+      // Validate redemption eligibility for confirmed status (redemption)
+      if (status === 'confirmed' && transaction.type === TransactionType.PREDICT) {
+        try {
+          // Use receipt ID if available, otherwise use nonce as the receipt ID
+          const receiptId = transaction.receiptId || transaction.nonce;
+
+          // Verify the prediction is actually a winner on the blockchain
+          const isWinner = await predictionContractStore.isPredictionWinner(receiptId);
+
+          // For PREDICT transactions, 'confirmed' status should only be set if it won on-chain
+          if (!isWinner) {
+            custodyLogger.warn(
+              { transactionId: id, receiptId },
+              'Attempt to confirm (redeem) a prediction that is not a winner on the blockchain'
+            );
+
+            return {
+              ...transaction,
+              status: 'rejected',
+              rejectedAt: new Date().toISOString(),
+              rejectionReason: 'Prediction is not eligible for redemption according to the blockchain.'
+            };
+          }
+
+          custodyLogger.info(
+            { transactionId: id, receiptId },
+            'Confirmed prediction is a winner on the blockchain, proceeding with redemption'
+          );
+        } catch (verificationError) {
+          custodyLogger.error(
+            {
+              transactionId: id,
+              error: verificationError instanceof Error ? verificationError.message : String(verificationError)
+            },
+            'Error verifying prediction winner status on blockchain'
+          );
+
+          // In case of verification error, proceed with caution
+          // We'll accept the status change, but log the issue
+        }
+      }
+
       const now = new Date().toISOString();
       const updatedTransaction = { ...transaction, status };
 
@@ -593,6 +846,193 @@ export const custodyStore = {
     } catch (error) {
       custodyLogger.error({ transactionId, error }, 'Error deleting custody transaction');
       return false;
+    }
+  },
+
+  /**
+   * Synchronize submitted prediction statuses with blockchain state
+   * This is a batch operation to update all submitted predictions in custody
+   * This should be called periodically (e.g., by a cron job)
+   */
+  async syncSubmittedPredictionStatuses(): Promise<{
+    success: boolean;
+    updated: number;
+    errors: number;
+    error?: string;
+    details?: {
+      won: number;
+      lost: number;
+      pending: number;
+      redeemed: number;
+    };
+  }> {
+    try {
+      custodyLogger.info({}, 'Starting batch synchronization of submitted prediction statuses');
+
+      // Get all markets to find all transactions
+      const marketsResult = await marketStore.getMarkets();
+      const markets = marketsResult.items;
+
+      if (markets.length === 0) {
+        return { success: true, updated: 0, errors: 0, details: { won: 0, lost: 0, pending: 0, redeemed: 0 } };
+      }
+
+      // Track stats for detailed reporting
+      let totalUpdated = 0;
+      let totalErrors = 0;
+      let wonCount = 0;
+      let lostCount = 0;
+      let pendingCount = 0;
+      let redeemedCount = 0;
+
+      // Process market by market to avoid memory issues
+      for (const market of markets) {
+        try {
+          custodyLogger.debug({ marketId: market.id }, 'Processing market for submitted predictions');
+
+          // Get all transactions for this market
+          const transactions = await this.getMarketTransactions(market.id);
+
+          // Filter for submitted prediction transactions only
+          const submittedPredictions = transactions.filter(tx =>
+            tx.type === TransactionType.PREDICT && tx.status === 'submitted'
+          );
+
+          if (submittedPredictions.length === 0) {
+            continue; // No submitted predictions for this market
+          }
+
+          custodyLogger.info({
+            marketId: market.id,
+            submittedCount: submittedPredictions.length
+          }, 'Found submitted predictions for market');
+
+          // Get receipt IDs for these predictions
+          const receiptIds = submittedPredictions.map(tx => tx.receiptId || tx.nonce);
+
+          // Check the blockchain status for these predictions
+          const statusUpdates = await predictionContractStore.getStatusUpdatesForPendingPredictions(receiptIds);
+
+          console.log({ statusUpdates })
+
+          // Update the counts
+          wonCount += statusUpdates.won.length;
+          lostCount += statusUpdates.lost.length;
+          totalErrors += statusUpdates.errors.length;
+
+          // Update the status for won predictions
+          for (const receiptId of statusUpdates.won) {
+            const tx = submittedPredictions.find(t => (t.receiptId || t.nonce) === receiptId);
+            if (tx) {
+              try {
+                // Get reward quote to update potential payout
+                const reward = await predictionContractStore.getRewardQuote(receiptId);
+                const now = new Date().toISOString();
+
+                // Update transaction with blockchain verification
+                const updatedTx = {
+                  ...tx,
+                  blockchainStatus: 'won' as UserFacingStatus,
+                  verifiedAt: now,
+                  isVerifiedWinner: true,
+                  potentialPayout: reward?.dy || tx.potentialPayout
+                };
+
+                // Store updated transaction
+                await kvStore.storeEntity('CUSTODY_TRANSACTION', tx.id, updatedTx);
+                totalUpdated++;
+
+                custodyLogger.debug({
+                  transactionId: tx.id,
+                  receiptId,
+                  blockchainStatus: 'won'
+                }, 'Updated transaction to won status based on blockchain');
+              } catch (error) {
+                custodyLogger.error({
+                  transactionId: tx?.id,
+                  receiptId,
+                  error: error instanceof Error ? error.message : String(error)
+                }, 'Error updating transaction to won status');
+                totalErrors++;
+              }
+            }
+          }
+
+          // Update the status for lost predictions
+          for (const receiptId of statusUpdates.lost) {
+            const tx = submittedPredictions.find(t => (t.receiptId || t.nonce) === receiptId);
+            if (tx) {
+              try {
+                const now = new Date().toISOString();
+
+                // Update transaction with blockchain verification
+                const updatedTx = {
+                  ...tx,
+                  blockchainStatus: 'lost' as UserFacingStatus,
+                  verifiedAt: now,
+                  isVerifiedWinner: false
+                };
+
+                // Store updated transaction
+                await kvStore.storeEntity('CUSTODY_TRANSACTION', tx.id, updatedTx);
+                totalUpdated++;
+
+                custodyLogger.debug({
+                  transactionId: tx.id,
+                  receiptId,
+                  blockchainStatus: 'lost'
+                }, 'Updated transaction to lost status based on blockchain');
+              } catch (error) {
+                custodyLogger.error({
+                  transactionId: tx?.id,
+                  receiptId,
+                  error: error instanceof Error ? error.message : String(error)
+                }, 'Error updating transaction to lost status');
+                totalErrors++;
+              }
+            }
+          }
+        } catch (marketError) {
+          custodyLogger.error({
+            marketId: market.id,
+            error: marketError instanceof Error ? marketError.message : String(marketError)
+          }, 'Error processing market for status updates');
+          totalErrors++;
+        }
+      }
+
+      custodyLogger.info({
+        totalUpdated,
+        totalErrors,
+        won: wonCount,
+        lost: lostCount,
+        pending: pendingCount,
+        redeemed: redeemedCount
+      }, 'Completed batch synchronization of submitted prediction statuses');
+
+      return {
+        success: true,
+        updated: totalUpdated,
+        errors: totalErrors,
+        details: {
+          won: wonCount,
+          lost: lostCount,
+          pending: pendingCount,
+          redeemed: redeemedCount
+        }
+      };
+    } catch (error) {
+      custodyLogger.error({
+        error: error instanceof Error ? error.message : String(error)
+      }, 'Error in batch synchronization of submitted prediction statuses');
+
+      return {
+        success: false,
+        updated: 0,
+        errors: 1,
+        error: 'Failed to synchronize prediction statuses: ' +
+          (error instanceof Error ? error.message : String(error))
+      };
     }
   },
 
@@ -673,31 +1113,15 @@ export const custodyStore = {
         };
       }
 
-      // Check if prediction has already been registered on chain by calling the contract
+      // Check if prediction has already been registered on chain
       try {
-        const [contractAddress, contractName] = [
-          batchConfig.contractAddress,
-          batchConfig.contractName
-        ];
-
-        // Import the needed functions for contract call
-        const { fetchCallReadOnlyFunction, ClarityType } = await import('@stacks/transactions');
-
         // Use receipt ID if available, otherwise try to use nonce as the receipt ID
         const receiptId = transaction.receiptId || transaction.nonce;
 
-        // Call the get-owner function to check if the receipt exists on chain
-        const result = await fetchCallReadOnlyFunction({
-          contractAddress,
-          contractName,
-          functionName: 'get-owner',
-          functionArgs: [uintCV(receiptId)],
-          network: batchConfig.network,
-          senderAddress: transaction.signer
-        });
+        // Use our prediction contract store to check if receipt exists on chain
+        const receiptExists = await predictionContractStore.doesReceiptExist(receiptId);
 
-        // If we get a successful response with an owner, it means the prediction exists on chain
-        if (result.type === ClarityType.ResponseOk && result.value && result.value.type !== ClarityType.OptionalNone) {
+        if (receiptExists) {
           return {
             canReturn: false,
             reason: 'Prediction already exists on the blockchain'
@@ -771,6 +1195,38 @@ export const custodyStore = {
         const error = 'Unauthorized: Only the user who made the prediction can return it';
         opLogger.warn({ transactionUserId: transaction.userId }, error);
         return { success: false, error };
+      }
+
+      // Final blockchain verification before transaction
+      try {
+        // Use receipt ID if available, otherwise try to use nonce as the receipt ID
+        const receiptId = transaction.receiptId || transaction.nonce;
+
+        // Do a final check against the blockchain to ensure it's not there
+        // This is critical to prevent returning something that's already on chain
+        const receiptExists = await predictionContractStore.doesReceiptExist(receiptId);
+
+        if (receiptExists) {
+          const error = 'Cannot return prediction: It has already been processed on the blockchain';
+          opLogger.warn({
+            transactionId,
+            receiptId
+          }, error);
+
+          // Update the transaction status to reflect blockchain state
+          await this.updateTransactionStatus(transactionId, 'submitted');
+
+          return {
+            success: false,
+            error,
+            transaction: await this.getTransaction(transactionId, { verifyBlockchain: true })
+          };
+        }
+      } catch (verificationError) {
+        // Log but continue - we already did initial verification
+        opLogger.warn({
+          error: verificationError instanceof Error ? verificationError.message : String(verificationError)
+        }, 'Error during final blockchain verification, proceeding with caution');
       }
 
       // Delete the transaction and its associated data

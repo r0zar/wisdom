@@ -25,7 +25,7 @@ export function generateUUID(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
   }
-  
+
   // Fallback implementation for environments where crypto.randomUUID() is not available
   // Based on the RFC4122 specification for UUID v4
   const getRandomBytes = (n: number): Uint8Array => {
@@ -42,12 +42,12 @@ export function generateUUID(): string {
   };
 
   const randomBytes = getRandomBytes(16);
-  
+
   // Set version (4) and variant bits
   // Use non-null assertion as we know index 6 and 8 exist in our 16-byte array
   randomBytes[6] = (randomBytes[6]! & 0x0f) | 0x40; // version 4
   randomBytes[8] = (randomBytes[8]! & 0x3f) | 0x80; // variant 10
-  
+
   // Convert to hex string with proper formatting
   let hex = '';
   for (let i = 0; i < 16; i++) {
@@ -57,7 +57,7 @@ export function generateUUID(): string {
       hex += '-';
     }
   }
-  
+
   return hex;
 }
 
@@ -114,7 +114,7 @@ export function getBaseUrl(): string {
 
 // Market query and search utilities
 
-export type MarketStatus = 'active' | 'resolved' | 'cancelled' | 'all';
+export type MarketStatus = 'active' | 'resolved' | 'cancelled' | 'closed' | 'all';
 export type MarketType = 'binary' | 'multiple' | 'all';
 export type SortField = 'createdAt' | 'endDate' | 'poolAmount' | 'participants';
 export type SortDirection = 'asc' | 'desc';
@@ -130,6 +130,12 @@ export interface MarketQueryOptions {
   cursor?: string;
   sortBy?: SortField;
   sortDirection?: SortDirection;
+  resolvedOutcomeId?: number;
+  resolvedAt?: string;
+  resolvedBy?: string;
+  adminFee?: number;
+  remainingPot?: number;
+  totalWinningAmount?: number;
 }
 
 export interface PaginatedResult<T> {
@@ -145,10 +151,10 @@ export interface PaginatedResult<T> {
  */
 export function searchMarketText(market: any, searchText: string): boolean {
   if (!searchText) return true;
-  
+
   const text = `${market.name} ${market.description}`.toLowerCase();
   const terms = searchText.toLowerCase().split(/\s+/).filter(Boolean);
-  
+
   return terms.every(term => text.includes(term));
 }
 
@@ -157,31 +163,32 @@ export function searchMarketText(market: any, searchText: string): boolean {
  */
 export function filterMarkets(markets: any[], options: MarketQueryOptions = {}): any[] {
   return markets.filter(market => {
+    console.log(options.status, market.status)
     // Status filter
     if (options.status && options.status !== 'all' && market.status !== options.status) {
       return false;
     }
-    
+
     // Category filter
     if (options.category && market.category !== options.category) {
       return false;
     }
-    
+
     // Type filter
     if (options.type && options.type !== 'all' && market.type !== options.type) {
       return false;
     }
-    
+
     // Creator filter
     if (options.creatorId && market.createdBy !== options.creatorId) {
       return false;
     }
-    
+
     // Text search
     if (options.search && !searchMarketText(market, options.search)) {
       return false;
     }
-    
+
     return true;
   });
 }
@@ -192,7 +199,7 @@ export function filterMarkets(markets: any[], options: MarketQueryOptions = {}):
 export function sortMarkets(markets: any[], sortBy: SortField = 'createdAt', sortDirection: SortDirection = 'desc'): any[] {
   return [...markets].sort((a, b) => {
     let comparison = 0;
-    
+
     // Handle different field types
     if (sortBy === 'createdAt' || sortBy === 'endDate') {
       const dateA = new Date(a[sortBy] || 0).getTime();
@@ -204,7 +211,7 @@ export function sortMarkets(markets: any[], sortBy: SortField = 'createdAt', sor
       const valB = b[sortBy] || 0;
       comparison = valA - valB;
     }
-    
+
     // Apply sort direction
     return sortDirection === 'asc' ? comparison : -comparison;
   });
@@ -217,13 +224,13 @@ export function paginateResults<T>(items: T[], options: { limit?: number; offset
   const limit = options.limit || 20;
   const offset = options.offset || 0;
   const paginatedItems = items.slice(offset, offset + limit);
-  
+
   return {
     items: paginatedItems,
     total: items.length,
     hasMore: offset + paginatedItems.length < items.length,
-    nextCursor: offset + paginatedItems.length < items.length 
-      ? `${offset + limit}` 
+    nextCursor: offset + paginatedItems.length < items.length
+      ? `${offset + limit}`
       : undefined
   };
 }

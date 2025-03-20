@@ -5,6 +5,7 @@ const storeModules = [
   'market-store',
   'prediction-store',
   'custody-store',
+  'prediction-contract-store',
   'user-balance-store',
   'user-stats-store',
   'bug-report-store',

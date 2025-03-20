@@ -17,6 +17,7 @@ import {
   TxBroadcastResult
 } from "@stacks/transactions";
 import { STACKS_MAINNET } from '@stacks/network';
+import { predictionContractStore, PredictionMarketInfo } from './prediction-contract-store';
 
 // Create a logger instance for this module
 const marketLogger = logger.child({ context: 'market-store' });
@@ -51,9 +52,32 @@ export interface Market {
   participants: number;
   poolAmount: number;
   status: string;
+  resolvedOutcomeId?: number;
+  resolvedAt?: string;
+  resolvedBy?: string;
+  adminFee?: number;
+  remainingPot?: number;
+  totalWinningAmount?: number;
 }
 
 // Market store with Vercel KV
+// Interface for blockchain verification result
+export interface MarketSyncResult {
+  marketId: string;
+  name: string;
+  status: 'already_synced' | 'updated' | 'error';
+  onChainData?: {
+    'is-open': boolean;
+    'is-resolved': boolean;
+    'winning-outcome'?: number;
+  };
+  localData?: {
+    status: string;
+    resolvedOutcomeId?: number;
+  };
+  error?: string;
+}
+
 export const marketStore = {
   // Get all markets
   async getMarkets(options?: MarketQueryOptions): Promise<PaginatedResult<Market>> {
@@ -119,6 +143,7 @@ export const marketStore = {
         category: options.category && idsToFetch === marketIds ? options.category : undefined,
         status: options.status && idsToFetch === marketIds ? options.status : undefined
       };
+      console.log(filterOpts)
 
       filteredMarkets = filterMarkets(validMarkets, filterOpts);
 
@@ -144,11 +169,101 @@ export const marketStore = {
     };
   },
 
-  // Get a specific market by ID
-  async getMarket(id: string) {
+  // Get a specific market by ID and verify its state with blockchain
+  async getMarket(id: string, options?: { verifyWithBlockchain?: boolean }) {
     try {
-      const market = await kvStore.getEntity('MARKET', id);
-      return market || undefined;
+      const market = await kvStore.getEntity('MARKET', id) as Market;
+
+      // Return undefined if market not found in KV store
+      if (!market) {
+        return undefined;
+      }
+
+      // If verification with blockchain is requested, check on-chain state
+      if (options?.verifyWithBlockchain) {
+        try {
+          // Get the on-chain market information
+          const onChainMarket = await this.getMarketInfo(id);
+
+          // If market exists on-chain, verify and potentially update its state
+          if (onChainMarket) {
+            // Extract the blockchain state
+            const isOpenOnChain = onChainMarket['is-open'];
+            const isResolvedOnChain = (onChainMarket['is-resolved']);
+            const winningOutcomeOnChain = Number(onChainMarket['winning-outcome']);
+
+            // Create a copy of the market to update without modifying the original
+            const verifiedMarket = { ...market };
+
+            // Update status based on blockchain state
+            if (isResolvedOnChain && market.status !== 'resolved') {
+              marketLogger.info({
+                marketId: id,
+                localStatus: market.status,
+                blockchainStatus: 'resolved'
+              }, 'Local market status differs from blockchain state');
+
+              verifiedMarket.status = 'resolved';
+              verifiedMarket.resolvedOutcomeId = winningOutcomeOnChain;
+
+              // Only set these if they're not already set
+              if (!verifiedMarket.resolvedAt) {
+                verifiedMarket.resolvedAt = new Date().toISOString();
+              }
+
+              if (!verifiedMarket.resolvedBy) {
+                verifiedMarket.resolvedBy = 'blockchain-verification';
+              }
+            } else if (!isOpenOnChain && !isResolvedOnChain && market.status !== 'closed') {
+              marketLogger.info({
+                marketId: id,
+                localStatus: market.status,
+                blockchainStatus: 'closed'
+              }, 'Local market status differs from blockchain state');
+
+              verifiedMarket.status = 'closed';
+            } else if (isOpenOnChain && !isResolvedOnChain && market.status !== 'active') {
+              marketLogger.info({
+                marketId: id,
+                localStatus: market.status,
+                blockchainStatus: 'active'
+              }, 'Local market status differs from blockchain state');
+
+              verifiedMarket.status = 'active';
+            }
+
+            // If resolved, ensure the winning outcome ID matches
+            if (isResolvedOnChain &&
+              verifiedMarket.resolvedOutcomeId !== winningOutcomeOnChain) {
+              marketLogger.warn({
+                marketId: id,
+                localOutcome: verifiedMarket.resolvedOutcomeId,
+                blockchainOutcome: winningOutcomeOnChain
+              }, 'Local winning outcome differs from blockchain state');
+
+              verifiedMarket.resolvedOutcomeId = winningOutcomeOnChain;
+            }
+
+            // If the market was updated, save the changes to the KV store
+            if (JSON.stringify(market) !== JSON.stringify(verifiedMarket)) {
+              marketLogger.info({ marketId: id }, 'Updating market in KV store to match blockchain state');
+              await kvStore.storeEntity('MARKET', id, verifiedMarket);
+            }
+
+            return verifiedMarket;
+          }
+        } catch (verificationError) {
+          // Log the error but don't fail the market retrieval
+          marketLogger.error({
+            marketId: id,
+            error: verificationError instanceof Error
+              ? verificationError.message
+              : String(verificationError)
+          }, 'Error verifying market with blockchain');
+        }
+      }
+
+      return market;
     } catch (error) {
       if (error instanceof AppError) {
         // Just rethrow AppErrors
@@ -162,6 +277,26 @@ export const marketStore = {
           data: { marketId: id }
         }).log();
       }
+    }
+  },
+
+  /**
+   * Get market information directly from the blockchain
+   * This calls the prediction contract store to get the on-chain market data
+   * @param id Market ID
+   * @returns Market information from blockchain or null if not found
+   */
+  async getMarketInfo(id: string): Promise<PredictionMarketInfo | null> {
+    try {
+      // Use the prediction contract store to get the market info from the blockchain
+      const marketInfo = await predictionContractStore.getMarketInfo(id);
+      return marketInfo;
+    } catch (error) {
+      marketLogger.error(
+        { marketId: id, error: error instanceof Error ? error.message : String(error) },
+        'Failed to get market info from blockchain'
+      );
+      return null;
     }
   },
 
@@ -874,6 +1009,217 @@ export const marketStore = {
       }, 'Failed to auto-close expired markets');
 
       return { success: false, processed: 0, closed: 0, errors: 1 };
+    }
+  },
+
+  /**
+   * Synchronize market statuses with blockchain state
+   * This checks all markets against their on-chain state and updates them if they don't match
+   * @returns Results of the synchronization operation
+   */
+  async syncMarketsWithBlockchain(): Promise<{
+    success: boolean;
+    processed: number;
+    updated: number;
+    errors: number;
+    syncResults: MarketSyncResult[];
+  }> {
+    try {
+      marketLogger.info({}, 'Starting market synchronization with blockchain');
+
+      // Get all markets
+      const marketsResult = await this.getMarkets({ limit: 500 });
+      const markets = marketsResult.items;
+
+      if (markets.length === 0) {
+        return {
+          success: true,
+          processed: 0,
+          updated: 0,
+          errors: 0,
+          syncResults: []
+        };
+      }
+
+      // Initialize counters and results
+      let processed = 0;
+      let updated = 0;
+      let errors = 0;
+      const syncResults: MarketSyncResult[] = [];
+
+      // Process each market
+      for (const market of markets) {
+        try {
+          processed++;
+          marketLogger.debug({ marketId: market.id }, `Checking on-chain state for market ${market.name}`);
+
+          // Get the on-chain market information
+          const onChainMarket = await this.getMarketInfo(market.id);
+
+          // Skip if market not found on chain
+          if (!onChainMarket) {
+            marketLogger.warn({ marketId: market.id }, `Market ${market.name} not found on blockchain`);
+            syncResults.push({
+              marketId: market.id,
+              name: market.name,
+              status: 'error',
+              error: 'Market not found on blockchain'
+            });
+            errors++;
+            continue;
+          }
+
+          // Extract the blockchain state
+          const isOpenOnChain = onChainMarket['is-open'];
+          const isResolvedOnChain = onChainMarket['is-resolved'];
+          const winningOutcomeOnChain = onChainMarket['winning-outcome'];
+
+          // Check if the local state matches the on-chain state
+          const isStatusMatch = (
+            (market.status === 'active' && isOpenOnChain && !isResolvedOnChain) ||
+            (market.status === 'resolved' && isResolvedOnChain) ||
+            (market.status === 'closed' && !isOpenOnChain)
+          );
+
+          // Check if outcome matches when both are resolved
+          // If market is resolved on-chain but has no resolvedOutcomeId in database,
+          // we should consider this a mismatch
+          const isOutcomeMatch = (
+            !isResolvedOnChain ||
+            (isResolvedOnChain && market.resolvedOutcomeId !== undefined &&
+              market.resolvedOutcomeId === winningOutcomeOnChain)
+          );
+
+          // If states match, continue to next market
+          if (isStatusMatch && isOutcomeMatch) {
+            marketLogger.debug({ marketId: market.id }, `Market ${market.name} is already synced with blockchain`);
+            syncResults.push({
+              marketId: market.id,
+              name: market.name,
+              status: 'already_synced',
+              onChainData: {
+                'is-open': isOpenOnChain,
+                'is-resolved': isResolvedOnChain,
+                'winning-outcome': winningOutcomeOnChain
+              },
+              localData: {
+                status: market.status,
+                resolvedOutcomeId: market.resolvedOutcomeId
+              }
+            });
+            continue;
+          }
+
+          // Update the market to match blockchain state
+          const updates: any = {};
+
+          // Update status based on on-chain state
+          if (!isStatusMatch) {
+            if (isResolvedOnChain) {
+              updates.status = 'resolved';
+              updates.resolvedAt = new Date().toISOString();
+
+              // If we're changing to resolved status, we should set resolvedBy to indicate this was done by the system
+              if (!market.resolvedBy) {
+                updates.resolvedBy = 'blockchain-sync';
+              }
+            } else if (!isOpenOnChain) {
+              updates.status = 'closed';
+            } else {
+              updates.status = 'active';
+            }
+          }
+
+          // Update resolved outcome if needed
+          // This handles both the case where resolvedOutcomeId doesn't match winningOutcomeOnChain
+          // and the case where resolvedOutcomeId is undefined but the market is resolved on-chain
+          if (isResolvedOnChain &&
+            (market.resolvedOutcomeId === undefined || market.resolvedOutcomeId !== winningOutcomeOnChain)) {
+            updates.resolvedOutcomeId = winningOutcomeOnChain;
+
+            // If we're adding a resolved outcome ID, also ensure resolved status and timestamps are set
+            if (!updates.status) {
+              updates.status = 'resolved';
+            }
+
+            if (!updates.resolvedAt) {
+              updates.resolvedAt = new Date().toISOString();
+            }
+
+            if (!market.resolvedBy && !updates.resolvedBy) {
+              updates.resolvedBy = 'blockchain-sync';
+            }
+          }
+
+          // Apply updates to the market
+          if (Object.keys(updates).length > 0) {
+            marketLogger.info({
+              marketId: market.id,
+              updates
+            }, `Updating market ${market.name} to match blockchain state`);
+
+            // Update the market
+            await this.updateMarket(market.id, updates);
+            updated++;
+
+            syncResults.push({
+              marketId: market.id,
+              name: market.name,
+              status: 'updated',
+              onChainData: {
+                'is-open': isOpenOnChain,
+                'is-resolved': isResolvedOnChain,
+                'winning-outcome': winningOutcomeOnChain
+              },
+              localData: {
+                status: market.status,
+                resolvedOutcomeId: market.resolvedOutcomeId
+              }
+            });
+          }
+
+        } catch (error) {
+          errors++;
+          marketLogger.error({
+            marketId: market.id,
+            error: error instanceof Error ? error.message : String(error)
+          }, `Error syncing market ${market.name} with blockchain`);
+
+          syncResults.push({
+            marketId: market.id,
+            name: market.name,
+            status: 'error',
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+
+      // Log summary
+      marketLogger.info({
+        processed,
+        updated,
+        errors
+      }, 'Completed market synchronization with blockchain');
+
+      return {
+        success: true,
+        processed,
+        updated,
+        errors,
+        syncResults
+      };
+    } catch (error) {
+      marketLogger.error({
+        error: error instanceof Error ? error.message : String(error)
+      }, 'Failed to synchronize markets with blockchain');
+
+      return {
+        success: false,
+        processed: 0,
+        updated: 0,
+        errors: 1,
+        syncResults: []
+      };
     }
   }
 };
