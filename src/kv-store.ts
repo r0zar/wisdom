@@ -39,7 +39,10 @@ export const KV_PREFIXES = {
   USER_TRANSACTIONS: 'user_transactions',
   SIGNER_TRANSACTIONS: 'signer_transactions',
   MARKET_TRANSACTIONS: 'market_transactions',
-  CUSTODY_NFT_RECEIPT: 'custody_nft_receipt'
+  CUSTODY_NFT_RECEIPT: 'custody_nft_receipt',
+  // Claim reward transaction prefixes
+  CLAIM_REWARD_TRANSACTION: 'claim_reward_transaction',
+  USER_CLAIM_REWARDS: 'user_claim_rewards'
 } as const;
 
 // Type safety for valid entity types

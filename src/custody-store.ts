@@ -4,8 +4,8 @@ import { AppError, logger } from './logger';
 import { marketStore } from './market-store';
 import { userBalanceStore } from './user-balance-store';
 import { userStatsStore } from './user-stats-store';
-import { 
-  predictionContractStore, 
+import {
+  predictionContractStore,
   SignedTransactionParams,
   BatchPredictionOperation,
   BatchClaimOperation
@@ -29,7 +29,7 @@ export enum TransactionType {
 }
 
 // User-facing status types
-export type UserFacingStatus = 'pending' | 'won' | 'lost' | 'redeemed';
+export type UserFacingStatus = 'unresolved' | 'won' | 'lost' | 'redeemed';
 
 // Interface for a transaction in custody
 export interface CustodyTransaction {
@@ -290,7 +290,7 @@ export const custodyStore = {
 
       // Get all transactions in parallel
       const transactions = await Promise.all(
-        transactionIds.map(id => this.getTransaction(id))
+        transactionIds.map(id => this.getTransaction(id, { verifyBlockchain: true }))
       );
 
       // Filter out any undefined transactions (in case of data inconsistency)
@@ -466,23 +466,12 @@ export const custodyStore = {
       return transaction.blockchainStatus;
     }
 
-    // Otherwise, derive from technical status
-    if (transaction.status === 'pending') {
-      return 'pending';
-    }
-
     if (transaction.status === 'confirmed') {
       return 'redeemed';
     }
 
-    if (transaction.status === 'rejected') {
-      // Rejected predictions are similar to lost ones from user perspective
-      return 'lost';
-    }
-
-    // For 'submitted' status, we don't know if it's won/lost without blockchain
     // Default to pending for safety
-    return 'pending';
+    return 'unresolved';
   },
 
   /**
@@ -494,7 +483,7 @@ export const custodyStore = {
    */
   async getTransaction(
     id: string,
-    options?: { verifyBlockchain?: boolean }
+    options: { verifyBlockchain?: boolean } = { verifyBlockchain: true }
   ): Promise<CustodyTransaction> {
     try {
       const transaction = await kvStore.getEntity('CUSTODY_TRANSACTION', id) as CustodyTransaction;
@@ -504,7 +493,7 @@ export const custodyStore = {
       }
 
       // If blockchain verification is requested and this is a prediction
-      if (options?.verifyBlockchain &&
+      if (options.verifyBlockchain &&
         transaction.type === TransactionType.PREDICT &&
         transaction.status === 'submitted') {
 
@@ -514,6 +503,8 @@ export const custodyStore = {
 
           // Get the prediction status from the blockchain
           const onChainStatus = await predictionContractStore.getPredictionStatus(receiptId);
+
+          console.log(onChainStatus)
 
           // If we got a valid status from blockchain
           if (onChainStatus) {
@@ -1295,7 +1286,7 @@ export const custodyStore = {
       } else {
         pendingPredictions = await this.getAllPendingPredictions()
       }
-      
+
       // Log details about pending predictions before filtering
       if (pendingPredictions.length > 0) {
         custodyLogger.info({
@@ -1630,6 +1621,456 @@ export const custodyStore = {
       }).log();
 
       return { success: false, error: appError.message };
+    }
+  },
+
+  /**
+   * Create a claim reward transaction with custody
+   * This function allows users to claim rewards for winning predictions via Signet
+   * 
+   * @param data Transaction and claim data
+   * @returns Result with transaction details or error
+   */
+  async createClaimRewardWithCustody(data: {
+    // Transaction data from the signed transaction
+    signature: string;
+    nonce: number;
+    signer: string;
+    subnetId: string;
+
+    // Claim data
+    predictionId: string; // Database ID for the prediction
+    receiptId: number; // On-chain identifier (nonce)
+    userId: string; // User claiming the reward
+  }): Promise<{
+    success: boolean;
+    transaction?: any;
+    error?: string;
+    txid?: string;
+  }> {
+    try {
+      // Set up structured logging for this operation
+      const opLogger = custodyLogger.child({
+        operation: 'createClaimRewardWithCustody',
+        predictionId: data.predictionId,
+        receiptId: data.receiptId,
+        userId: data.userId
+      });
+
+      opLogger.info({}, 'Starting claim reward process');
+
+      // Input validation
+      if (!data.signature || !data.predictionId || !data.receiptId || !data.userId) {
+        const error = new AppError({
+          message: 'Invalid claim reward data',
+          context: 'custody-store',
+          code: 'CLAIM_REWARD_VALIDATION_ERROR',
+          data: {
+            hasSignature: !!data.signature,
+            hasPredictionId: !!data.predictionId,
+            hasReceiptId: !!data.receiptId,
+            hasUserId: !!data.userId
+          }
+        }).log();
+
+        return { success: false, error: error.message };
+      }
+
+      // Verify this prediction is eligible for claiming
+      opLogger.debug({ receiptId: data.receiptId }, 'Verifying prediction is eligible for claiming');
+
+      // Check if prediction exists on chain and is a winner
+      const isWinner = await predictionContractStore.isPredictionWinner(data.receiptId);
+
+      if (!isWinner) {
+        const error = new AppError({
+          message: 'Prediction is not eligible for reward claim',
+          context: 'custody-store',
+          code: 'PREDICTION_NOT_WINNER',
+          data: {
+            predictionId: data.predictionId,
+            receiptId: data.receiptId
+          }
+        }).log();
+
+        return { success: false, error: error.message };
+      }
+
+      // Get the reward quote to know how much this prediction will pay out
+      const rewardQuote = await predictionContractStore.getRewardQuote(data.receiptId);
+
+      if (!rewardQuote || rewardQuote.dy <= 0) {
+        const error = new AppError({
+          message: 'No reward available for this prediction',
+          context: 'custody-store',
+          code: 'NO_REWARD_AVAILABLE',
+          data: {
+            predictionId: data.predictionId,
+            receiptId: data.receiptId,
+            rewardQuote
+          }
+        }).log();
+
+        return { success: false, error: error.message };
+      }
+
+      opLogger.debug({
+        receiptId: data.receiptId,
+        potentialPayout: rewardQuote.dy
+      }, 'Prediction verified as winner with available reward');
+
+      // Create transaction record directly for claim reward
+      const id = `claim-${data.signature.substring(0, 10)}-${data.receiptId}`;
+      const now = new Date().toISOString();
+
+      const transaction = {
+        id,
+        signature: data.signature,
+        nonce: data.nonce,
+        signer: data.signer,
+        type: 'claim-reward',
+        subnetId: data.subnetId,
+        receiptId: data.receiptId,
+        userId: data.userId,
+        createdAt: now,
+        status: 'pending',
+        potentialPayout: rewardQuote.dy,
+        redeemed: true,
+        blockchainStatus: 'redeemed' as UserFacingStatus
+      };
+
+      console.log(transaction)
+
+      // Store the transaction
+      await kvStore.storeEntity('CLAIM_REWARD_TRANSACTION', id, transaction);
+
+      // Also add to user's transactions set for lookup
+      await kvStore.addToSet('USER_CLAIM_REWARDS', data.userId, id);
+
+      opLogger.debug(
+        {
+          transactionId: id,
+          receiptId: data.receiptId,
+          potentialPayout: rewardQuote.dy
+        },
+        'Created claim reward transaction'
+      );
+
+      // Store transaction for batch processing - don't submit directly
+      opLogger.info(
+        { transactionId: id },
+        'Claim reward transaction stored successfully, awaiting batch processing'
+      );
+
+      return {
+        success: true,
+        transaction
+      };
+    } catch (error) {
+      // If it's already an AppError, just log and return it
+      if (error instanceof AppError) {
+        error.log();
+        return { success: false, error: error.message };
+      }
+
+      // Handle other errors
+      const appError = new AppError({
+        message: 'Failed to create claim reward transaction',
+        context: 'custody-store',
+        code: 'CLAIM_REWARD_ERROR',
+        originalError: error instanceof Error ? error : new Error(String(error)),
+        data: {
+          predictionId: data.predictionId,
+          receiptId: data.receiptId,
+          userId: data.userId
+        }
+      }).log();
+
+      return { success: false, error: appError.message };
+    }
+  },
+
+  /**
+   * Get all claim reward transactions for a user
+   * 
+   * @param userId User ID to get claim reward transactions for
+   * @returns Array of claim reward transactions
+   */
+  async getUserClaimRewardTransactions(userId: string): Promise<any[]> {
+    try {
+      if (!userId) return [];
+
+      // Get all transaction IDs for the user
+      const transactionIds = await kvStore.getSetMembers('USER_CLAIM_REWARDS', userId);
+
+      if (transactionIds.length === 0) {
+        return [];
+      }
+
+      // Get all transactions in parallel
+      const transactions = await Promise.all(
+        transactionIds.map(id => kvStore.getEntity('CLAIM_REWARD_TRANSACTION', id))
+      );
+
+      // Filter out any undefined transactions (in case of data inconsistency)
+      return transactions.filter(Boolean);
+    } catch (error) {
+      custodyLogger.error({ userId, error }, 'Error getting user claim reward transactions');
+      return [];
+    }
+  },
+
+  /**
+   * Get a specific claim reward transaction by ID
+   * 
+   * @returns The transaction object
+   */
+  async getAllClaimRewardTransactions(): Promise<any[]> {
+    try {
+      const transactions = await kvStore.getEntity('CLAIM_REWARD_TRANSACTION', '') as any[];
+      return transactions;
+    } catch (error) {
+      custodyLogger.error({ error }, 'Error getting claim reward transaction');
+      return [];
+    }
+  },
+
+  /**
+   * Get a specific claim reward transaction by ID
+   * 
+   * @param id The transaction ID
+   * @returns The transaction object
+   */
+  async getClaimRewardTransaction(id: string): Promise<any> {
+    try {
+      if (!id) return null;
+
+      const transaction = await kvStore.getEntity('CLAIM_REWARD_TRANSACTION', id);
+      return transaction || null;
+    } catch (error) {
+      custodyLogger.error({ transactionId: id, error }, 'Error getting claim reward transaction');
+      return null;
+    }
+  },
+
+  /**
+   * Get all pending claim reward transactions
+   * @returns Array of pending claim reward transactions
+   */
+  async getAllPendingClaimRewards(): Promise<any[]> {
+    try {
+      // Get all user IDs with claim rewards
+      const users = await kvStore.getKeys('user_claim_rewards:*');
+
+      custodyLogger.debug({ userCount: users.length }, 'Getting pending claim reward transactions');
+
+      // Collect all transactions
+      const allTransactions = [];
+      for (const userKey of users) {
+        // Extract user ID from the key (format: 'user_claim_rewards:userId')
+        const userId = userKey.split(':')[1];
+        if (!userId) continue;
+
+        const claimIds = await kvStore.getSetMembers('USER_CLAIM_REWARDS', userId);
+        if (claimIds.length === 0) continue;
+
+        // Get all claim transactions for this user
+        const userClaims = await Promise.all(
+          claimIds.map(id => this.getClaimRewardTransaction(id))
+        );
+
+        // Add valid transactions to our list
+        allTransactions.push(...userClaims.filter(Boolean));
+      }
+
+      // Filter for pending transactions only
+      const pendingClaims = allTransactions.filter(tx => tx?.status === 'pending');
+
+      custodyLogger.info({ pendingCount: pendingClaims.length }, 'Found pending claim reward transactions');
+
+      return pendingClaims;
+    } catch (error) {
+      custodyLogger.error({ error }, 'Error getting all pending claim reward transactions');
+      return [];
+    }
+  },
+
+  /**
+   * Process pending claim reward transactions in batches to send them on-chain
+   * This function is intended to be called by a cron job
+   * @param options Optional parameters to customize batch processing
+   * @returns Results of the batch processing operation
+   */
+  async batchProcessClaimRewards(options?: {
+    forceProcess?: boolean; // If true, process all pending transactions regardless of age
+  }): Promise<{
+    success: boolean;
+    processed: number;
+    batched: number;
+    errors: number;
+    error?: string;
+    txid?: string;
+  }> {
+    try {
+      // Calculate the cutoff time for processing (only process txs older than this)
+      const now = new Date();
+      const cutoffTime = new Date(now.getTime() - (batchConfig.minAgeMinutes * 60 * 1000));
+      const cutoffTimeISO = cutoffTime.toISOString();
+
+      custodyLogger.info(
+        { minAgeMinutes: batchConfig.minAgeMinutes, cutoffTime: cutoffTimeISO },
+        'Starting batch claim reward processing'
+      );
+
+      // Find all pending claim reward transactions
+      const pendingClaims = await this.getAllPendingClaimRewards();
+
+      // Log details about pending claims before filtering
+      if (pendingClaims.length > 0) {
+        custodyLogger.info({
+          allPendingClaims: pendingClaims.map(tx => ({
+            id: tx?.id,
+            createdAt: tx?.createdAt,
+            receiptId: tx?.receiptId
+          })),
+          cutoffTimeISO,
+          forceProcess: options?.forceProcess
+        }, 'Pending claim rewards before age filtering');
+      }
+
+      // Decide if we should apply age filtering
+      const shouldApplyAgeFilter = !options?.forceProcess;
+
+      if (options?.forceProcess) {
+        custodyLogger.info({ forceProcess: true }, 'Forcing processing of all pending claim rewards regardless of age');
+      }
+
+      // Filter and sort transactions by age (oldest first)
+      const eligibleClaims = pendingClaims
+        .filter(tx => {
+          // Skip age check if forceProcess is true
+          if (!shouldApplyAgeFilter) {
+            return true;
+          }
+
+          const isPastCutoff = tx.createdAt < cutoffTimeISO;
+
+          if (!isPastCutoff) {
+            custodyLogger.debug({
+              transactionId: tx.id,
+              createdAt: tx.createdAt,
+              cutoffTimeISO
+            }, 'Claim reward transaction not eligible due to age');
+          }
+
+          return isPastCutoff;
+        })
+        .sort((a, b) => (a.createdAt > b.createdAt ? 1 : -1));
+
+      const eligibleCount = eligibleClaims.length;
+      const totalCount = pendingClaims.length;
+
+      custodyLogger.info(
+        {
+          totalPending: totalCount,
+          eligibleForProcessing: eligibleCount,
+          maxBatchSize: batchConfig.maxBatchSize
+        },
+        'Found pending claim reward transactions'
+      );
+
+      // If no eligible transactions, return early
+      if (eligibleCount === 0) {
+        return { success: true, processed: 0, batched: 0, errors: 0 };
+      }
+
+      // Take only up to maxBatchSize transactions
+      const transactionsToProcess = eligibleClaims.slice(0, batchConfig.maxBatchSize);
+      const batchSize = transactionsToProcess.length;
+
+      custodyLogger.info(
+        { batchSize, oldestTxTime: transactionsToProcess[0]?.createdAt },
+        'Processing batch of claim reward transactions'
+      );
+
+      // Transform transactions to the format expected by the batchClaimReward function
+      const operations = transactionsToProcess.map(tx => ({
+        signet: {
+          signature: tx.signature,
+          nonce: tx.nonce,
+          signer: tx.signer
+        },
+        receiptId: tx.receiptId
+      }));
+
+      // Use the contract store to process the batch
+      const result = await predictionContractStore.batchClaimReward(operations);
+
+      if (!result.success || !result.txid) {
+        throw new AppError({
+          message: result.error || 'Failed to process batch claim reward transaction',
+          context: 'custody-store',
+          code: 'BATCH_CLAIM_ERROR',
+          data: { error: result.error }
+        }).log();
+      }
+
+      custodyLogger.info(
+        { txid: result.txid, batchSize },
+        'Successfully submitted batch claim reward transaction'
+      );
+
+      // Update the status of all processed transactions
+      let updatedCount = 0;
+      for (const tx of transactionsToProcess) {
+        try {
+          // Mark the transaction as submitted
+          tx.status = 'submitted';
+          tx.submittedAt = new Date().toISOString();
+          tx.txid = result.txid;
+          await kvStore.storeEntity('CLAIM_REWARD_TRANSACTION', tx.id, tx);
+          updatedCount++;
+        } catch (updateError) {
+          custodyLogger.error(
+            { txId: tx.id, error: updateError },
+            'Failed to update claim reward transaction status to submitted'
+          );
+        }
+      }
+
+      return {
+        success: true,
+        processed: eligibleCount,
+        batched: batchSize,
+        errors: batchSize - updatedCount,
+        txid: result.txid
+      };
+    } catch (error) {
+      // Log and return the error
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      custodyLogger.error(
+        { error: errorMessage },
+        'Error in batch processing claim rewards'
+      );
+
+      if (error instanceof AppError) {
+        return {
+          success: false,
+          processed: 0,
+          batched: 0,
+          errors: 1,
+          error: error.message
+        };
+      }
+
+      return {
+        success: false,
+        processed: 0,
+        batched: 0,
+        errors: 1,
+        error: `Failed to process batch claim rewards: ${errorMessage}`
+      };
     }
   }
 };
